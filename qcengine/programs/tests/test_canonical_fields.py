@@ -70,6 +70,8 @@ def test_protocol_native(program, model, keywords, native, schema_versions, requ
         "cfour": rf"\*CFOUR\(BASIS=6-31G",
         "dftd3": rf"1.000000     1.261000     1.703000",
         "gamess": rf"\$basis gbasis=n31 ngauss=6 \$end",
+        # rq-c01c892e
+        "gaussian": rf"#.*HF/STO-3G",
         "jaguar": rf"basis=6-31G",
         "gcp": rf"level HF3C",
         "mctc-gcp": rf"level DFT/SV",
@@ -82,6 +84,8 @@ def test_protocol_native(program, model, keywords, native, schema_versions, requ
         "cfour": ("GRD", rf"1.0+\s+0.0+\s+0.0+\s+0.03"),
         "dftd3": ("dftd3_geometry.xyz", rf"H\s+0.0+\s+0.0+\s+0.34"),
         "gamess": ("gamess.dat", rf"CLOSED SHELL ORBITALS --- GENERATED AT"),
+        # rq-c01c892e
+        "gaussian": ("gaussian.log", rf"Normal termination of Gaussian"),
         "jaguar": ("dispatch.01.in", rf"&gen"),
         "gcp": ("gcp_geometry.xyz", rf"H\s+0.0+\s+0.0+\s+0.34"),
         "mctc-gcp": ("gcp_geometry.xyz", rf"H\s+0.0+\s+0.0+\s+0.34"),

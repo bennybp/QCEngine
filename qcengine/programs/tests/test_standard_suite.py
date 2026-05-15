@@ -81,6 +81,7 @@ def _trans_key(qc, bas, key):
             return {
                 "cfour": ("pvdz", {}),
                 "gamess": ("ccd", {"contrl__ispher": 1}),
+                "gaussian": ("cc-pVDZ", {}),  # rq-81bc1d68
                 "jaguar": (bas, {}),
                 "nwchem": ("cc-pvdz", {"basis__spherical": True}),
                 "psi4": (bas, {}),
@@ -93,6 +94,7 @@ def _trans_key(qc, bas, key):
             return {
                 "cfour": ("aug-pvdz", {}),
                 "gamess": ("accd", {"contrl__ispher": 1}),
+                "gaussian": ("aug-cc-pVDZ", {}),  # rq-81bc1d68
                 "jaguar": ("cc-pVDZ++", {}),
                 "nwchem": ("aug-cc-pvdz", {"basis__spherical": True}),
                 "psi4": (bas, {}),
@@ -105,6 +107,7 @@ def _trans_key(qc, bas, key):
             return {
                 "cfour": ("qz2p", {}),
                 "gamess": (None, {}),  # not in GAMESS-US library
+                "gaussian": (None, {}),  # not in Gaussian library
                 "jaguar": (None, {}),  # not in Jaguar library
                 "nwchem": (None, {}),  # not in NWChem library
                 "psi4": (bas, {}),
