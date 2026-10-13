@@ -12,6 +12,7 @@ import qcelemental as qcel
 from qcelemental.models.v2 import AtomicInput, AtomicSpecification, BasisSet, Molecule
 
 from qcengine.exceptions import InputError, ResourceError, UnknownError
+from qcengine.programs.gaussian.basis import _cartesian_flags, build_bse_basis, parse_bse_basis
 from qcengine.programs.gaussian.germinate import muster_modelchem
 from qcengine.programs.gaussian.harvester import harvest, is_normal_termination
 from qcengine.programs.gaussian.keywords import build_com_file, build_route_line
@@ -2228,3 +2229,218 @@ def test_gaussian_b3lyp_d3_hessian_water(water):
 
     qcvars = result.extras["qcvars"]
     assert abs(float(qcvars["B3LYP-D3 DISPERSION CORRECTION ENERGY"]) - (-0.0000078919)) < atol
+
+
+# ---------------------------------------------------------------------------
+# Basis Set Exchange ("bse:" basis) support
+# ---------------------------------------------------------------------------
+
+
+def _hi_mol(ghost_iodine=False, extra_ghost_hi=False):
+    """HI, optionally with the I made a ghost or a ghost HI appended."""
+    symbols = ["H", "I"]
+    geometry = [0.0, 0.0, 0.0, 0.0, 0.0, 3.04]
+    real = [True, not ghost_iodine]
+    if extra_ghost_hi:
+        symbols += ["H", "I"]
+        geometry += [0.0, 0.0, 8.0, 0.0, 0.0, 11.04]
+        real += [False, False]
+    return Molecule.from_data(
+        {
+            "symbols": symbols,
+            "geometry": geometry,
+            "real": real,
+            "molecular_charge": 0,
+            "molecular_multiplicity": 2 if ghost_iodine else 1,
+        }
+    )
+
+
+def _bse_com(harness, mol, basis, keywords=None):
+    inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program="gaussian", driver="energy", model={"method": "HF", "basis": basis}, keywords=keywords or {}))
+    with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
+        return harness.build_input(inp, _default_taskconfig())["infiles"]["gaussian.com"]
+
+
+@pytest.mark.parametrize(
+    "basis, expected",
+    [
+        ("bse:cc-pvdz", ("cc-pvdz", None)),
+        ("BSE:cc-pVDZ:1", ("cc-pVDZ", "1")),
+        ("bse:6-31G*:", ("6-31G*", None)),
+    ],
+)
+def test_parse_bse_basis(basis, expected):
+    assert parse_bse_basis(basis) == expected
+
+
+@pytest.mark.parametrize("basis", ["bse:", "bse:cc-pvdz:1:2"])
+def test_parse_bse_basis_invalid_raises(basis):
+    with pytest.raises(InputError, match="Invalid BSE basis"):
+        parse_bse_basis(basis)
+
+
+def test_bse_cartesian_flags_mixed_raises():
+    basis_dict = {
+        "elements": {
+            "1": {"electron_shells": [{"angular_momentum": [2], "function_type": "gto_spherical"}]},
+            "8": {"electron_shells": [{"angular_momentum": [2], "function_type": "gto_cartesian"}]},
+        }
+    }
+    with pytest.raises(InputError, match="mixes Cartesian and spherical d"):
+        _cartesian_flags(basis_dict, ["1", "8"])
+
+
+def test_bse_cartesian_flags_none_without_shells():
+    basis_dict = {"elements": {"1": {"electron_shells": [{"angular_momentum": [0], "function_type": "gto"}]}}}
+    assert _cartesian_flags(basis_dict, ["1"]) == (None, None)
+
+
+@using("basis_set_exchange")
+def test_bse_build_input_spherical(harness, water):
+    com = _bse_com(harness, water, "bse:cc-pvdz")
+    lines = com.splitlines()
+    assert [ln for ln in lines if ln.startswith("#P")] == ["#P HF/Gen 5D"]
+    # Only elements in the molecule are written, after the molecule block.
+    assert "O     0" in lines and "H     0" in lines
+    assert "He     0" not in lines
+    assert "! Basis set: cc-pVDZ  Version: 1" in lines
+    assert lines.index("O     0") > max(i for i, ln in enumerate(lines) if ln.lstrip().startswith("H "))
+    # The basis section is terminated by exactly one blank line.
+    assert com.endswith("****\n\n")
+
+
+@using("basis_set_exchange")
+def test_bse_build_input_cartesian(harness, water):
+    com = _bse_com(harness, water, "bse:6-31G*")
+    assert [ln for ln in com.splitlines() if ln.startswith("#P")] == ["#P HF/Gen 6D"]
+
+
+@using("basis_set_exchange")
+def test_bse_route_keywords_transition_metal():
+    # 6-31G* on Zn: Cartesian d, spherical f
+    result = build_bse_basis("bse:6-31G*", ["Zn", "O"], [True, True])
+    assert result["route_basis"] == "Gen"
+    assert result["route_keywords"] == ["6D", "7F"]
+
+
+@using("basis_set_exchange")
+def test_bse_build_input_ecp(harness):
+    com = _bse_com(harness, _hi_mol(), "bse:def2-svp")
+    assert [ln for ln in com.splitlines() if ln.startswith("#P")] == ["#P HF/GenECP 5D"]
+    assert "I-ECP" in com
+    assert com.endswith("\n\n") and not com.endswith("\n\n\n")
+
+
+@using("basis_set_exchange")
+def test_bse_ghost_only_element_has_no_ecp(harness):
+    com = _bse_com(harness, _hi_mol(ghost_iodine=True), "bse:def2-svp")
+    assert [ln for ln in com.splitlines() if ln.startswith("#P")] == ["#P UHF/Gen 5D"]
+    assert "I     0" in com.splitlines()
+    assert "I-ECP" not in com
+
+
+@using("basis_set_exchange")
+def test_bse_mixed_real_and_ghost_element_keeps_ecp(harness):
+    com = _bse_com(harness, _hi_mol(extra_ghost_hi=True), "bse:def2-svp")
+    assert [ln for ln in com.splitlines() if ln.startswith("#P")] == ["#P HF/GenECP 5D"]
+    assert "I-ECP" in com
+
+
+@using("basis_set_exchange")
+@pytest.mark.parametrize(
+    "basis, match",
+    [
+        ("bse:not-a-basis", "does not exist"),
+        ("bse:cc-pvdz:99", "Version 99 does not exist"),
+        ("bse:6-31G(2df,p)", "not found in basis"),
+    ],
+)
+def test_bse_unavailable_basis_raises(harness, basis, match):
+    mol = Molecule.from_data("K 0 0 0\nH 0 0 2.2") if "2df" in basis else Molecule.from_data("He 0 0 0")
+    with pytest.raises(InputError, match=match):
+        _bse_com(harness, mol, basis)
+
+
+@using("basis_set_exchange")
+@pytest.mark.parametrize("keyword", ["6D", "5d", "10F", "7f"])
+def test_bse_user_pure_cartesian_keyword_raises(harness, water, keyword):
+    with pytest.raises(InputError, match="conflicts with basis"):
+        _bse_com(harness, water, "bse:cc-pvdz", keywords={keyword: ""})
+
+
+def test_bse_missing_library_raises(harness, water):
+    with patch.dict("sys.modules", {"basis_set_exchange": None}):
+        with pytest.raises(ModuleNotFoundError, match="basis_set_exchange"):
+            _bse_com(harness, water, "bse:cc-pvdz")
+
+
+def test_build_com_file_with_basis_block():
+    com = build_com_file(
+        link0={"NProcShared": 1, "Mem": "1GB"},
+        route_line="#P HF/Gen",
+        title="t",
+        charge=0,
+        multiplicity=1,
+        atom_block="He  0.0  0.0  0.0",
+        basis_block="He     0\nS    1   1.00\n      1.0   1.0\n****",
+    )
+    assert com.endswith("He  0.0  0.0  0.0\n\nHe     0\nS    1   1.00\n      1.0   1.0\n****\n\n")
+
+
+@using("gaussian")
+@using("basis_set_exchange")
+@pytest.mark.parametrize(
+    "bse_basis, builtin_basis, driver",
+    [
+        ("bse:cc-pvdz", "cc-pVDZ", "gradient"),
+        ("bse:6-31G*", "6-31G*", "energy"),
+    ],
+)
+def test_gaussian_bse_matches_builtin_water(water, bse_basis, builtin_basis, driver):
+    """A BSE basis written as Gen reproduces Gaussian's built-in definition."""
+    import qcengine as qcng
+
+    def run(basis):
+        inp = AtomicInput(molecule=water, specification=AtomicSpecification(program="gaussian", driver=driver, model={"method": "HF", "basis": basis}))
+        return qcng.compute(inp, "gaussian", raise_error=True)
+
+    bse_res, ref_res = run(bse_basis), run(builtin_basis)
+    assert bse_res.properties.calcinfo_nbasis == ref_res.properties.calcinfo_nbasis
+    assert abs(bse_res.properties.return_energy - ref_res.properties.return_energy) < 1.0e-9
+    assert np.allclose(bse_res.return_result, ref_res.return_result, atol=1.0e-8)
+
+
+@using("gaussian")
+@using("basis_set_exchange")
+@pytest.mark.parametrize("extra_ghost_hi", [False, True])
+def test_gaussian_bse_ecp_matches_builtin(extra_ghost_hi):
+    """def2-SVP on HI (with an ECP on I), with and without a ghost HI."""
+    import qcengine as qcng
+
+    mol = _hi_mol(extra_ghost_hi=extra_ghost_hi)
+
+    def run(basis):
+        inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program="gaussian", driver="energy", model={"method": "HF", "basis": basis}))
+        return qcng.compute(inp, "gaussian", raise_error=True)
+
+    bse_res, ref_res = run("bse:def2-svp"), run("def2SVP")
+    assert bse_res.properties.calcinfo_nbasis == ref_res.properties.calcinfo_nbasis
+    # BSE and Gaussian's built-in def2-SVP coefficients differ in rounding
+    assert abs(bse_res.return_result - ref_res.return_result) < 1.0e-7
+
+
+@using("gaussian")
+@using("psi4")
+@using("basis_set_exchange")
+def test_gaussian_bse_matches_psi4(water):
+    """pcseg-1 is not built into Gaussian; both programs read it from the BSE."""
+    import qcengine as qcng
+
+    def run(program, keywords):
+        inp = AtomicInput(molecule=water, specification=AtomicSpecification(program=program, driver="energy", model={"method": "HF", "basis": "bse:pcseg-1"}, keywords=keywords))
+        return qcng.compute(inp, program, raise_error=True)
+
+    gau = run("gaussian", {})
+    psi = run("psi4", {"scf_type": "pk"})
+    assert abs(gau.return_result - psi.return_result) < 1.0e-8

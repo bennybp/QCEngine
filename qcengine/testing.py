@@ -186,6 +186,7 @@ _programs = {
     "mctc-gcp": is_program_new_enough("mctc-gcp", "2.3.0"),
     "gcp": which("gcp", return_bool=True),  # mark is classic-gcp
     "geometric": which_import("geometric", return_bool=True),
+    "basis_set_exchange": which_import("basis_set_exchange", return_bool=True),
     "berny": which_import("berny", return_bool=True),
     "mdi": is_mdi_new_enough("1.2"),
     "molpro": is_program_new_enough("molpro", "2018.1"),

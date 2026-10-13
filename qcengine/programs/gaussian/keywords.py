@@ -66,6 +66,7 @@ def build_com_file(
     charge: int,
     multiplicity: int,
     atom_block: str,
+    basis_block: str = "",
 ) -> str:
     """Assemble a complete Gaussian .com input file.
 
@@ -84,6 +85,9 @@ def build_com_file(
         Spin multiplicity.
     atom_block:
         Newline-separated ``"<symbol> <x> <y> <z>"`` lines (Ångström).
+    basis_block:
+        Optional general-basis (Gen/GenECP) section written after the
+        molecule block. Must not contain blank lines.
 
     Returns
     -------
@@ -107,4 +111,6 @@ def build_com_file(
         atom_block,
         "",
     ]
+    if basis_block:
+        sections += [basis_block, ""]
     return "\n".join(sections) + "\n"

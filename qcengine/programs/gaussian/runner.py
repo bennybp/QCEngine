@@ -14,6 +14,7 @@ from ...util import execute
 from ..model import ProgramHarness
 from ..qcvar_identities_resources import build_atomicproperties, build_out
 from ..util import error_stamp
+from .basis import build_bse_basis, is_bse_basis
 from .germinate import muster_modelchem
 from .harvester import harvest, is_normal_termination
 from .keywords import build_com_file, build_route_line
@@ -219,11 +220,29 @@ class GaussianHarness(ProgramHarness):
             "Mem": f"{mem_gb}GB",
         }
 
+        # A "bse:" basis is fetched from the Basis Set Exchange and written
+        # inline as a general basis; the route names Gen/GenECP instead.
+        route_basis = basis
+        extra_keywords = modelchem["extra_keywords"]
+        basis_block = ""
+        if is_bse_basis(basis):
+            user_kw = input_model.specification.keywords or {}
+            for k in user_kw:
+                if k.upper() in ("5D", "6D", "7F", "10F"):
+                    raise InputError(
+                        f"Keyword '{k}' conflicts with basis '{basis}': the pure/Cartesian "
+                        "convention is taken from the Basis Set Exchange data."
+                    )
+            bse_basis = build_bse_basis(basis, mol.symbols, mol.real)
+            route_basis = bse_basis["route_basis"]
+            extra_keywords = {**extra_keywords, **{k: "" for k in bse_basis["route_keywords"]}}
+            basis_block = bse_basis["basis_block"]
+
         route_line = build_route_line(
             modelchem["method_string"],
-            basis,
+            route_basis,
             modelchem["job_type"],
-            modelchem["extra_keywords"],
+            extra_keywords,
             input_model.specification.keywords,
         )
 
@@ -234,6 +253,7 @@ class GaussianHarness(ProgramHarness):
             charge=int(mol.molecular_charge),
             multiplicity=int(mol.molecular_multiplicity),
             atom_block=atom_block,
+            basis_block=basis_block,
         )
 
         exe_path = _find_gaussian()
