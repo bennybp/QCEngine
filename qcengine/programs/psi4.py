@@ -4,6 +4,7 @@ Calls the Psi4 executable.
 import inspect
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Dict
@@ -167,6 +168,7 @@ class Psi4Harness(ProgramHarness):
         # Basis must not be None for HF3c
         old_basis = input_model.specification.model.basis
         input_model.specification.model.__dict__["basis"] = old_basis or ""
+        bse_basis = str(old_basis).lower().startswith("bse:")
 
         with temporary_directory(parent=parent, suffix="_psi_scratch", messy=config.scratch_messy) as tmpdir:
 
@@ -312,6 +314,14 @@ class Psi4Harness(ProgramHarness):
             ):
                 raise InputError(error_message)
             elif "RHF reference is only for singlets" in error_message:
+                raise InputError(error_message)
+            elif bse_basis and (
+                bse_error := re.search(r"KeyError: '((?:Basis set|Version) .* does not exist[^']*)'", error_message)
+            ):
+                # unknown name or version, raised by basis_set_exchange
+                raise InputError(f"Basis Set Exchange could not provide basis '{old_basis}': {bse_error.group(1)}")
+            elif bse_basis and "BasisSetNotFound" in error_message:
+                # an element the basis doesn't cover
                 raise InputError(error_message)
             else:
                 raise UnknownError(error_message)

@@ -3,6 +3,8 @@ Tests the DQM compute dispatch module
 """
 
 
+import re
+
 import numpy as np
 import pytest
 from qcelemental.testing import compare_values
@@ -195,6 +197,54 @@ def test_psi4_internal_failure(schema_versions, request):
         qcng.compute(psi4_task, "psi4", raise_error=True, return_version=retver)
 
     assert "reference is only" in str(exc.value)
+
+
+@uusing("psi4")
+@uusing("basis_set_exchange")
+def test_psi4_bse_basis(schema_versions, request):
+    models, retver, _ = schema_versions
+
+    mol = models.Molecule.from_data("O 0 0 0.1173\nH 0 0.7572 -0.4692\nH 0 -0.7572 -0.4692")
+
+    energies = {}
+    for basis in ["cc-pvdz", "bse:cc-pvdz", "bse:cc-pvdz:1"]:
+        model = {"method": "hf", "basis": basis}
+        if from_v2(request.node.name):
+            psi4_task = {
+                "molecule": mol,
+                "specification": {"driver": "energy", "model": model, "keywords": {"scf_type": "pk"}},
+            }
+        else:
+            psi4_task = {"molecule": mol, "driver": "energy", "model": model, "keywords": {"scf_type": "pk"}}
+        psi4_task = checkver_and_convert(psi4_task, request.node.name, "pre")
+        ret = qcng.compute(psi4_task, "psi4", raise_error=True, return_version=retver)
+        ret = checkver_and_convert(ret, request.node.name, "post")
+        energies[basis] = ret.return_result
+
+    assert compare_values(energies["cc-pvdz"], energies["bse:cc-pvdz"], atol=1.0e-9)
+    assert compare_values(energies["cc-pvdz"], energies["bse:cc-pvdz:1"], atol=1.0e-9)
+
+
+@uusing("psi4")
+@uusing("basis_set_exchange")
+@pytest.mark.parametrize("psiapi", [False, True])
+@pytest.mark.parametrize(
+    "basis, molstr, match",
+    [
+        ("bse:not-a-basis", "He 0 0 0", "Basis Set Exchange could not provide basis 'bse:not-a-basis': Basis set"),
+        ("bse:cc-pvdz:99", "He 0 0 0", "Version 99 does not exist"),
+        ("bse:6-31G(2df,p)", "K 0 0 0\nH 0 0 2.2", "BasisSetNotFound"),
+    ],
+)
+def test_psi4_bse_basis_unavailable(basis, molstr, match, psiapi):
+    from qcelemental.models.v2 import AtomicInput, Molecule
+
+    psi4_task = AtomicInput(
+        molecule=Molecule.from_data(molstr),
+        specification={"driver": "energy", "model": {"method": "hf", "basis": basis}, "extras": {"psiapi": psiapi}},
+    )
+    with pytest.raises(qcng.exceptions.InputError, match=re.escape(match)):
+        qcng.compute(psi4_task, "psi4", raise_error=True)
 
 
 @uusing("psi4")
