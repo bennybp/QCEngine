@@ -1,8 +1,9 @@
-"""Parse Gaussian log output using cclib for energies + regex for the few items cclib doesn't expose."""
+"""Parse Gaussian log output: energies from the log text and archive entry, geometry and gradients via cclib."""
 
 import io
 import re
-from typing import Optional, Tuple
+from decimal import Decimal
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import qcelemental as qcel
@@ -15,15 +16,223 @@ _NORMAL_TERMINATION_RE = re.compile(r"Normal termination of Gaussian")
 _VERSION_RE = re.compile(r"Gaussian\s+(\d+),\s+Revision\s+([\w.]+),")
 
 
-# rq-f6537c40 — eV → Hartree converter for cclib-stored energies.
-# cclib stores ccdata.scfenergies / mpenergies / ccenergies / dispersionenergies
-# in eV using its internal Hartree↔eV factor (27.21138505). Reversing with
-# cclib's own factor (via cclib.parser.utils.convertor) is a structurally exact
-# round-trip (≤ 1 ULP); reversing with qcel's factor (27.21138602) introduces a
-# ~3.6e-6 Ha bias that exceeds cross-program tolerances.
-def _cclib_ev_to_hartree(value_ev: float) -> float:
-    from cclib.parser.utils import convertor
-    return convertor(value_ev, "eV", "hartree")
+# Archive entry ("1\\1\\GINC-...\\@") printed at the end of a normal termination.
+# Its first section names the job type and the method Gaussian actually ran
+# (e.g. "RCCSD(T)-FC"); the "Version=" section lists energies of every level
+# computed at the reference geometry, rounded to ~7 decimals.
+_ARCHIVE_START_RE = re.compile(r"1\\1\\GINC")
+_FORCES_MARKER = "Forces (Hartrees/Bohr)"
+_HF_SCF_LABELS = {"RHF", "UHF", "ROHF"}
+_SCF_DONE_RE = re.compile(r"SCF Done:\s+E\((\S+)\)\s+=\s+(\S+)")
+_DISPERSION_RE = re.compile(r"Dispersion energy=\s+(\S+)\s+Hartrees")
+_DOUBLE_HYBRID_RE = re.compile(r"E2\((\S+)\)\s+=\s+(\S+)\s+E\(\1\)\s+=\s+(\S+)")
+_ALPHA_BETA_RE = re.compile(r"(\d+)\s+alpha electrons\s+(\d+)\s+beta electrons")
+_PUNCH_NUMBER_RE = re.compile(r"^-?\d*\.\d+D[+-]\d+$")
+_AMPLITUDES_RE = r"Wavefunction amplitudes converged\. +E\(Corr\)= +(\S+)"
+
+# Post-SCF levels on an HF reference: archive label -> (qcvar stem, full-precision log pattern).
+# A job prints at most one of CISD/CCD/CCSD/QCISD, so they share the amplitudes line.
+_CORRELATED_LEVELS = {
+    "MP2": ("MP2", r"EUMP2 *= *(\S+)"),
+    "MP3": ("MP3", r"EUMP3 *= *(\S+)"),
+    "MP4DQ": ("MP4(DQ)", r"UMP4\(DQ\) *= *(\S+)"),
+    "MP4SDQ": ("MP4(SDQ)", r"UMP4\(SDQ\) *= *(\S+)"),
+    "MP4SDTQ": ("MP4", r"UMP4\(SDTQ\) *= *(\S+)"),
+    "CISD": ("CISD", _AMPLITUDES_RE),
+    "CCD": ("CCD", _AMPLITUDES_RE),
+    "CCSD": ("CCSD", _AMPLITUDES_RE),
+    "QCISD": ("QCISD", _AMPLITUDES_RE),
+    "CCSD(T)": ("CCSD(T)", r"(?<!Q)CCSD\(T\) *= *(\S+)"),
+    "QCISD(T)": ("QCISD(T)", r"QCISD\(T\) *= *(\S+)"),
+}
+
+# Archive values are rounded to 6-7 decimals.
+_ARCHIVE_ATOL = 2.0e-6
+
+
+class UnsupportedMethodError(Exception):
+    """Gaussian ran a method whose energies the harvester cannot extract."""
+
+
+def _parse_archive(log_content: str) -> Tuple[str, Dict[str, str]]:
+    """Return (method, {key: value}) from the last archive entry in the log.
+
+    Values are the raw strings of the "Version=" section, e.g. "HF" -> "-76.0105"
+    or "Dipole" -> "0.,0.,-0.6358857".
+    """
+    starts = [m.start() for m in _ARCHIVE_START_RE.finditer(log_content)]
+    if not starts:
+        raise ValueError("No archive entry found in the Gaussian log.")
+    text = log_content[starts[-1] :]
+    end = text.find("\\\\@")
+    text = re.sub(r"\n ", "", text[: end if end != -1 else len(text)])
+    sections = text.split("\\\\")
+    fields = sections[0].split("\\")
+    if len(fields) < 5:
+        raise ValueError("Malformed archive entry in the Gaussian log.")
+
+    items = {}
+    for section in sections:
+        if section.startswith("Version="):
+            for item in section.split("\\"):
+                key, _, value = item.partition("=")
+                items[key] = value
+    return fields[4], items
+
+
+def _parse_punch(punch_content: str, natoms: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Parse the derivatives that Punch=Derivatives writes to fort.7 after the archive copy.
+
+    Returns the gradient (natoms, 3) and, for frequency jobs, the full Hessian
+    (3*natoms, 3*natoms) from its row-wise lower triangle, in the input
+    orientation. Jobs without derivatives leave only the archive copy: (None, None).
+    """
+    # The archive copy may wrap anywhere (even inside its closing "\\@"), so take
+    # the run of Fortran-format numbers at the end of the file.
+    tokens = punch_content.split()
+    start = len(tokens)
+    while start > 0 and _PUNCH_NUMBER_RE.match(tokens[start - 1]):
+        start -= 1
+    values = np.array([_fortran_float(t) for t in tokens[start:]])
+    ndim = 3 * natoms
+    ntri = ndim * (ndim + 1) // 2
+    if len(values) == 0:
+        return None, None
+    if len(values) == ndim:
+        return values.reshape(natoms, 3), None
+    if len(values) != ndim + ntri:
+        raise ValueError(f"Unexpected number of values ({len(values)}) in the Gaussian punch file.")
+    hess = np.zeros((ndim, ndim))
+    hess[np.tril_indices(ndim)] = values[ndim:]
+    hess = hess + np.tril(hess, -1).T
+    return values[:ndim].reshape(natoms, 3), hess
+
+
+def _method_family(archive_method: str) -> str:
+    """Reduce an archive method label (e.g. "UCCSD(T)-FC") to its level ("CCSD(T)").
+
+    Labels that are not HF or a known post-SCF level (DFT functionals,
+    semiempirical methods) are returned unchanged.
+    """
+    name = re.sub(r"-(FC\d*|Full)$", "", archive_method)
+    for prefix in ("RO", "R", "U"):
+        if name.startswith(prefix) and (name[len(prefix) :] == "HF" or name[len(prefix) :] in _CORRELATED_LEVELS):
+            return name[len(prefix) :]
+    return name
+
+
+def _decimal(text: str) -> Decimal:
+    return Decimal(text.replace("D", "E").replace("d", "e"))
+
+
+def _check_archive(label: str, value: Decimal, archive: Dict[str, Decimal]) -> None:
+    if abs(float(value - archive[label])) > _ARCHIVE_ATOL:
+        raise ValueError(
+            f"Gaussian {label} energy {value} from the log disagrees with the archive entry ({archive[label]})."
+        )
+
+
+def harvest_energies(
+    log_content: str,
+    functional_label: Optional[str] = None,
+    dispersion_level: Optional[str] = None,
+) -> PreservingDict:
+    """Extract energies at the reference geometry from a Gaussian log.
+
+    What was computed is taken from the archive entry, so the result follows
+    what Gaussian actually ran rather than the requested method string.
+    Full-precision values come from the log body, restricted to the part
+    before the first gradient printout (later SCF/post-SCF blocks belong to
+    the displaced geometries of a numerical Hessian), and are cross-checked
+    against the archive values.
+
+    Raises
+    ------
+    UnsupportedMethodError
+        If Gaussian ran a post-SCF method the harvester does not know.
+    ValueError
+        If the log is incomplete or inconsistent.
+    """
+    method, items = _parse_archive(log_content)
+    archive = {k: Decimal(v) for k, v in items.items() if k == "HF" or k in _CORRELATED_LEVELS}
+    if "HF" not in archive:
+        raise ValueError("No HF= energy found in the Gaussian archive entry.")
+    family = _method_family(method)
+
+    ref_end = _ARCHIVE_START_RE.search(log_content).start()
+    forces_at = log_content.find(_FORCES_MARKER)
+    if forces_at != -1:
+        ref_end = min(ref_end, forces_at)
+    ref_text = log_content[:ref_end]
+
+    # Last SCF before the reference cut: Stable=Opt reruns the SCF at the same geometry.
+    scf_matches = _SCF_DONE_RE.findall(ref_text)
+    if not scf_matches:
+        raise ValueError("No 'SCF Done' line found in the Gaussian log.")
+    scf_label, scf_text = scf_matches[-1]
+    scf = _decimal(scf_text)
+    _check_archive("HF", scf, archive)
+
+    # Gaussian includes empirical dispersion in the SCF Done energy.
+    disp_matches = _DISPERSION_RE.findall(ref_text)
+    disp = _decimal(disp_matches[-1]) if disp_matches else None
+
+    qcvars = PreservingDict()
+    qcvars["SCF TOTAL ENERGY"] = scf
+    qcvars["CURRENT REFERENCE ENERGY"] = scf
+    if disp is not None:
+        qcvars["DISPERSION CORRECTION ENERGY"] = disp
+
+    if scf_label in _HF_SCF_LABELS:
+        qcvars["HF TOTAL ENERGY"] = scf if disp is None else scf - disp
+        current = scf
+        for label, (stem, pattern) in _CORRELATED_LEVELS.items():
+            if label not in archive:
+                continue
+            matches = re.findall(pattern, ref_text)
+            if not matches:
+                if label == family:
+                    raise ValueError(f"Could not find the full-precision {label} energy in the Gaussian log.")
+                continue
+            value = _decimal(matches[0])
+            _check_archive(label, value, archive)
+            qcvars[f"{stem} TOTAL ENERGY"] = value
+            qcvars[f"{stem} CORRELATION ENERGY"] = value - scf
+            if label == family:
+                current = value
+        if family != "HF" and family not in _CORRELATED_LEVELS:
+            raise UnsupportedMethodError(
+                f"Gaussian ran method '{method}', whose energy the Gaussian harness cannot extract. "
+                f"Supported post-HF levels: {sorted(_CORRELATED_LEVELS)}."
+            )
+    else:
+        # DFT or another non-HF SCF (e.g. semiempirical)
+        if any(label in archive for label in _CORRELATED_LEVELS if label != "MP2"):
+            raise UnsupportedMethodError(
+                f"Gaussian ran method '{method}' with post-SCF levels the Gaussian harness cannot extract."
+            )
+        current = scf
+        if "MP2" in archive:
+            # double hybrid: the archive MP2 entry is the double-hybrid total
+            dh = _DOUBLE_HYBRID_RE.findall(ref_text)
+            if not dh:
+                raise ValueError(f"Could not find the double-hybrid energy for '{method}' in the Gaussian log.")
+            _, e2_text, total_text = dh[0]
+            current = _decimal(total_text)
+            _check_archive("MP2", current, archive)
+            qcvars["DOUBLE-HYBRID CORRECTION ENERGY"] = _decimal(e2_text)
+        qcvars["DFT TOTAL ENERGY"] = current
+        qcvars["DFT FUNCTIONAL TOTAL ENERGY"] = scf if disp is None else scf - disp
+
+    qcvars["CURRENT ENERGY"] = current
+
+    if disp is not None and functional_label is not None and dispersion_level is not None:
+        tag = f"{functional_label}-{dispersion_level}"
+        qcvars[f"{tag} DISPERSION CORRECTION ENERGY"] = disp
+        qcvars[f"{tag} TOTAL ENERGY"] = current
+        qcvars[f"{functional_label} FUNCTIONAL TOTAL ENERGY"] = scf - disp
+
+    return qcvars
 
 
 def _fortran_float(s: str) -> float:
@@ -83,6 +292,7 @@ def harvest(
     in_mol: Molecule,
     method: str,
     log_content: str,
+    punch_content: Optional[str] = None,
 ) -> Tuple[PreservingDict, Optional[np.ndarray], Optional[np.ndarray], Molecule]:
     """Parse a Gaussian log file and return QC data for building an AtomicResult.
 
@@ -94,6 +304,8 @@ def harvest(
         Lowercase QCSchema method string (e.g. "hf", "mp2", "b3lyp").
     log_content:
         Full text of gaussian.log.
+    punch_content:
+        Text of fort.7 from Punch=Derivatives, if present; preferred source of the Hessian.
 
     Returns
     -------
@@ -116,27 +328,13 @@ def harvest(
     ccdata = cclib.io.ccopen(io.StringIO(log_content)).parse()
 
     qcvars = PreservingDict()
-    method_lower = method.lower()
 
-    # rq-1d5da737 — Strip an empirical-dispersion suffix from the method so the
-    # existing per-method energy extraction below sees just the functional name.
-    # The stripped suffix is retained as `dispersion_level` / `functional_label`
-    # so the qcvars at the end of this function can be tagged correctly.
+    # rq-1d5da737 — a recognised dispersion suffix on the method gives the
+    # formal label used to tag the functional-specific dispersion qcvars.
     from .germinate import recognize_dispersion
 
     functional, _emp_disp_value, dispersion_level, _ = recognize_dispersion(method)
-    method_lower = functional.lower()
     functional_label = functional.upper() if dispersion_level is not None else None
-
-    # Normalise method variants: strip Gaussian-specific sub-options like ",full"
-    # so that energy-extraction logic sees the canonical method name.
-    # e.g. "ccsd(t,full)" → "ccsd(t)"
-    _METHOD_NORMALISE = {
-        "ccsd(t,full)": "ccsd(t)",
-        # rq-2cb2c5c0
-        "mp2(full)": "mp2",
-    }
-    method_lower = _METHOD_NORMALISE.get(method_lower, method_lower)
 
     # --- Geometry and output molecule ---
     # rq-8d6fc024 rq-a76c3d7b rq-b7c7b8cb
@@ -184,11 +382,11 @@ def harvest(
         qcvars["N BASIS FUNCTIONS"] = str(ccdata.nbasis)
     if hasattr(ccdata, "nmo") and ccdata.nmo is not None:
         qcvars["N MOLECULAR ORBITALS"] = str(ccdata.nmo)
-    # cclib doesn't have nalpha/nbeta directly; derive from homos array
-    if hasattr(ccdata, "homos") and ccdata.homos is not None:
-        qcvars["N ALPHA ELECTRONS"] = str(ccdata.homos[0] + 1)
-        nbeta = ccdata.homos[-1] + 1 if len(ccdata.homos) > 1 else ccdata.homos[0] + 1
-        qcvars["N BETA ELECTRONS"] = str(nbeta)
+    # cclib's homos has a single entry for ROHF, so read the counts from the log
+    alpha_beta = _ALPHA_BETA_RE.search(log_content)
+    if alpha_beta:
+        qcvars["N ALPHA ELECTRONS"] = alpha_beta.group(1)
+        qcvars["N BETA ELECTRONS"] = alpha_beta.group(2)
 
     # rq-0753cd03
     qcvars["NUCLEAR REPULSION ENERGY"] = str(round(calc_mol.nuclear_repulsion_energy(), 10))
@@ -219,83 +417,8 @@ def harvest(
         )  # identity AlignmentMill
 
     # --- Energies ---
-    # Read all SCF, MP*, and CC energies from cclib's parsed attributes,
-    # converting eV→Hartree via cclib's own converter (structurally exact;
-    # ≤ 1 ULP round-trip).
-
-    # rq-37f40e92 — HF/SCF energy from cclib.
-    if not hasattr(ccdata, "scfenergies") or ccdata.scfenergies is None or len(ccdata.scfenergies) == 0:
-        raise ValueError("cclib did not populate `scfenergies` for this Gaussian log.")
-    scf_hartree = _cclib_ev_to_hartree(float(ccdata.scfenergies[-1]))
-    qcvars["HF TOTAL ENERGY"] = str(scf_hartree)
-    qcvars["SCF TOTAL ENERGY"] = str(scf_hartree)
-    qcvars["CURRENT REFERENCE ENERGY"] = str(scf_hartree)
-
-    # rq-929a262a rq-c5165f1f — method-specific variables
-    if method_lower in ("hf", "scf") or _is_dft(method_lower):
-        qcvars["CURRENT ENERGY"] = str(scf_hartree)
-
-    elif method_lower == "mp2":
-        # rq-578bb785
-        if not hasattr(ccdata, "mpenergies") or ccdata.mpenergies is None or len(ccdata.mpenergies) == 0:
-            raise ValueError("cclib did not populate `mpenergies` for this MP2 Gaussian log.")
-        mp2_hartree = _cclib_ev_to_hartree(float(ccdata.mpenergies[-1][-1]))
-        qcvars["MP2 TOTAL ENERGY"] = str(mp2_hartree)
-        qcvars["MP2 CORRELATION ENERGY"] = str(mp2_hartree - scf_hartree)
-        qcvars["CURRENT ENERGY"] = str(mp2_hartree)
-
-    elif method_lower == "ccsd":
-        # rq-1b7ae62e
-        if not hasattr(ccdata, "ccenergies") or ccdata.ccenergies is None or len(ccdata.ccenergies) == 0:
-            raise ValueError("cclib did not populate `ccenergies` for this CCSD Gaussian log.")
-        ccsd_hartree = _cclib_ev_to_hartree(float(ccdata.ccenergies[-1]))
-        qcvars["CCSD TOTAL ENERGY"] = str(ccsd_hartree)
-        qcvars["CCSD CORRELATION ENERGY"] = str(ccsd_hartree - scf_hartree)
-        qcvars["CURRENT ENERGY"] = str(ccsd_hartree)
-
-    elif method_lower == "ccsd(t)":
-        # rq-eddef743 — cclib's ccenergies for a CCSD(T) job holds only the
-        # CCSD(T) total (the intermediate CCSD value is not separately stored),
-        # so no CCSD qcvar is emitted here.
-        if not hasattr(ccdata, "ccenergies") or ccdata.ccenergies is None or len(ccdata.ccenergies) == 0:
-            raise ValueError("cclib did not populate `ccenergies` for this CCSD(T) Gaussian log.")
-        ccsdt_hartree = _cclib_ev_to_hartree(float(ccdata.ccenergies[-1]))
-        qcvars["CCSD(T) TOTAL ENERGY"] = str(ccsdt_hartree)
-        qcvars["CCSD(T) CORRELATION ENERGY"] = str(ccsdt_hartree - scf_hartree)
-        qcvars["CURRENT ENERGY"] = str(ccsdt_hartree)
-
-    else:
-        # Unknown method: fall back to SCF energy
-        qcvars["CURRENT ENERGY"] = str(scf_hartree)
-
-    # --- Empirical dispersion correction ---
-    # rq-1d5da737 — Gaussian writes the dispersion contribution on a separate
-    # "Dispersion energy=" line; cclib keeps it out of `scfenergies` and
-    # stores it (in eV) in `dispersionenergies`. Add it to the SCF total when
-    # present.
-    disp_hartree: Optional[float] = None
-    if (
-        hasattr(ccdata, "dispersionenergies")
-        and ccdata.dispersionenergies is not None
-        and len(ccdata.dispersionenergies) > 0
-    ):
-        disp_hartree = _cclib_ev_to_hartree(float(ccdata.dispersionenergies[-1]))
-
-    if disp_hartree is not None:
-        qcvars["DISPERSION CORRECTION ENERGY"] = str(disp_hartree)
-        # Only emit the dispersion-corrected DFT total when this was a DFT
-        # branch (i.e. CURRENT ENERGY currently == SCF). Post-HF branches
-        # (MP2/CCSD/CCSD(T)) handle their own totals.
-        if method_lower in ("hf", "scf") or _is_dft(method_lower):
-            qcvars["CURRENT ENERGY"] = str(scf_hartree + disp_hartree)
-        # Functional-specific qcvars (Psi4 convention) are emitted only when
-        # the input method carried a recognised dispersion suffix, so we know
-        # the formal dash label.
-        if dispersion_level is not None and functional_label is not None:
-            tag = f"{functional_label}-{dispersion_level}"
-            qcvars[f"{tag} DISPERSION CORRECTION ENERGY"] = str(disp_hartree)
-            qcvars[f"{tag} TOTAL ENERGY"] = str(scf_hartree + disp_hartree)
-            qcvars[f"{functional_label} FUNCTIONAL TOTAL ENERGY"] = str(scf_hartree)
+    # rq-37f40e92 rq-929a262a rq-c5165f1f rq-1d5da737
+    qcvars.update(harvest_energies(log_content, functional_label, dispersion_level))
 
     # --- Gradient (forces → negate for gradient) ---
     # rq-36736115 rq-3b0adf96
@@ -309,6 +432,7 @@ def harvest(
     # --- Hessian ---
     # rq-f2e32162 rq-344f3432
     hess: Optional[np.ndarray] = None
+    punch_hess = _parse_punch(punch_content, natoms)[1] if punch_content else None
     if hasattr(ccdata, "hessian") and ccdata.hessian is not None:
         # cclib hessian would be in standard orientation → transform with mill
         hess = mill.align_hessian(np.array(ccdata.hessian))
@@ -319,7 +443,7 @@ def harvest(
         # "Frc consts --" lines, but that's not the matrix we need. Fall back
         # to direct log parsing of "Force constants in Cartesian coordinates"
         # (printed in the INPUT orientation).
-        parsed_hess = _parse_force_constants(log_content, 3 * natoms)
+        parsed_hess = punch_hess if punch_hess is not None else _parse_force_constants(log_content, 3 * natoms)
         if parsed_hess is not None:
             if in_mol.fix_com and in_mol.fix_orientation:
                 # return_mol = in_mol (input frame), hessian already in input frame
@@ -335,9 +459,18 @@ def harvest(
 
     # --- Properties: dipole and Mulliken charges ---
     # rq-c7fd08b5 rq-943856cc rq-53f8ed12 rq-4c4a1542 rq-ffae3fa6
-    if hasattr(ccdata, "moments") and ccdata.moments is not None and len(ccdata.moments) > 1:
-        dipole_vec = np.array(ccdata.moments[1])
-        qcvars["DIPOLE MOMENT"] = str(float(np.linalg.norm(dipole_vec)))
+    # The archive dipole is in a.u. and the input orientation. For post-SCF
+    # gradients it may come from a correlated density, so only SCF methods report it.
+    _, archive_items = _parse_archive(log_content)
+    if "Dipole" in archive_items and "SCF TOTAL ENERGY" in qcvars and "MP2 TOTAL ENERGY" not in qcvars:
+        dipole = np.array([float(x) for x in archive_items["Dipole"].split(",")])
+        if not (in_mol.fix_com and in_mol.fix_orientation):
+            _, data = in_mol.align(calc_mol, **align_kwargs)
+            dipole = data["mill"].align_vector(dipole)
+        if "HF TOTAL ENERGY" in qcvars:
+            qcvars["HF DIPOLE"] = dipole
+        qcvars["SCF DIPOLE"] = dipole
+        qcvars["CURRENT DIPOLE"] = dipole
 
     if hasattr(ccdata, "atomcharges") and ccdata.atomcharges:
         mulliken = ccdata.atomcharges.get("mulliken")
@@ -354,7 +487,3 @@ def is_normal_termination(log_content: str) -> bool:
     """
     return bool(_NORMAL_TERMINATION_RE.search(log_content))
 
-
-def _is_dft(method_lower: str) -> bool:
-    """Return True for method strings that are not recognised wavefunction methods."""
-    return method_lower not in ("hf", "scf", "mp2", "ccsd", "ccsd(t)")

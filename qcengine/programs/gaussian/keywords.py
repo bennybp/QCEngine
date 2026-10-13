@@ -2,9 +2,27 @@
 
 from typing import Any, Dict
 
+from ...exceptions import InputError
+
 # Reserved user-keyword names that are handled via Link 0, not the route section.
 # rq-e7897f09
 _RESERVED_KEYWORDS = {"memory", "nprocs"}
+
+# Job-type keywords; the harness sets the job type from the driver.
+_JOB_TYPE_KEYWORDS = {"sp", "force", "freq", "opt", "irc", "ircmax", "scan", "admp", "bomd"}
+
+
+def _format_keyword(key: str, val: Any) -> str:
+    """Format one route keyword: bare, Key=Value, or Key=(opt1,opt2,...)."""
+    if val is None or val is True or val == "":
+        return key
+    if val is False:
+        raise InputError(f"Keyword '{key}' has value False; Gaussian keywords have no off form, omit it instead.")
+    if isinstance(val, dict):
+        return f"{key}=({','.join(_format_keyword(k, v) for k, v in val.items())})"
+    if isinstance(val, (list, tuple)):
+        return f"{key}=({','.join(str(v) for v in val)})"
+    return f"{key}={val}"
 
 
 # rq-3c343d2a
@@ -31,8 +49,10 @@ def build_route_line(
         A value of "" produces a bare key.
     user_keywords:
         Pass-through keywords from AtomicInput.keywords.  Any key NOT in
-        _RESERVED_KEYWORDS is appended verbatim.  A falsy value produces a
-        bare key.
+        _RESERVED_KEYWORDS is appended. ``None``, ``True`` or ``""`` produce a
+        bare key, a list or tuple ``Key=(a,b)`` and a dict ``Key=(a=1,b)``.
+        A user keyword replaces an ``extra_keywords`` entry of the same name.
+        Job-type keywords (Force, Freq, Opt, ...) raise InputError.
 
     Returns
     -------
@@ -45,15 +65,20 @@ def build_route_line(
     if job_type:
         parts.append(job_type)
 
+    user_keys = {key.lower() for key in user_keywords}
+    for key in user_keys & _JOB_TYPE_KEYWORDS:
+        raise InputError(f"Keyword '{key}' sets the Gaussian job type, which the harness derives from the driver.")
+
     # rq-cd0d6637
     for key, val in extra_keywords.items():
-        parts.append(f"{key}={val}" if val else key)
+        if key.lower() not in user_keys:
+            parts.append(_format_keyword(key, val))
 
     # rq-7152455e rq-e7897f09
     for key, val in user_keywords.items():
         if key.lower() in _RESERVED_KEYWORDS:
             continue
-        parts.append(f"{key}={val}" if val else key)
+        parts.append(_format_keyword(key, val))
 
     return " ".join(parts)
 

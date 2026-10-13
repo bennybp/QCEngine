@@ -126,8 +126,8 @@ def test_local_options_memory_gib(program, model, keywords, memory_trickery, sch
     stdout_ref = {  # 1.555 GiB = 208708567 quad-words
         "cfour": "Allocated    1592 MB of main memory",
         "gamess": "208000000 WORDS OF MEMORY AVAILABLE",
-        # rq-0edebcd3 — Gaussian echoes Link 0 %Mem in the log; int(1.555)=1
-        "gaussian": r"%Mem=1GB",
+        # rq-0edebcd3 — Gaussian echoes Link 0 %Mem in the log; 90% of 1.555 GiB in MB
+        "gaussian": r"%Mem=1433MB",
         "nwchem": r"total\s+=\s+2087085\d\d doubles =\s+1592.3 Mbytes",  # doubles is quad-words. Mbytes is MiB
         "psi4": "1592 MiB Core",
     }

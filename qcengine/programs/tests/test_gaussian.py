@@ -11,10 +11,16 @@ import pytest
 import qcelemental as qcel
 from qcelemental.models.v2 import AtomicInput, AtomicSpecification, BasisSet, Molecule
 
-from qcengine.exceptions import InputError, ResourceError, UnknownError
+from qcengine.exceptions import ConvergenceError, InputError, ResourceError, UnknownError
 from qcengine.programs.gaussian.basis import _cartesian_flags, build_bse_basis, parse_bse_basis
 from qcengine.programs.gaussian.germinate import muster_modelchem
-from qcengine.programs.gaussian.harvester import harvest, is_normal_termination
+from qcengine.programs.gaussian.harvester import (
+    UnsupportedMethodError,
+    _parse_punch,
+    harvest,
+    harvest_energies,
+    is_normal_termination,
+)
 from qcengine.programs.gaussian.keywords import build_com_file, build_route_line
 from qcengine.programs.gaussian import runner as gaussian_runner
 from qcengine.programs.gaussian.runner import GaussianHarness
@@ -26,27 +32,6 @@ requires_cclib = pytest.mark.skipif(not _cclib_available, reason="cclib not inst
 # ---------------------------------------------------------------------------
 # Shared test fixtures
 # ---------------------------------------------------------------------------
-
-# The harvester reads all energies via cclib's parsed attributes and reverses
-# the eV → Hartree conversion with cclib's own convertor (structurally exact).
-# Tests compute expected values via the same factor so the round-trip is exact.
-# Guard the import: when cclib is missing, every test that uses these helpers
-# is already gated behind @requires_cclib, so the module must still be
-# importable for collection on cclib-less CI runners.
-if _cclib_available:
-    from cclib.parser.utils import convertor as _cclib_convertor
-    _EV_TO_HARTREE = _cclib_convertor(1.0, "eV", "hartree")
-    _HARTREE_TO_EV = _cclib_convertor(1.0, "hartree", "eV")
-else:
-    _cclib_convertor = None
-    _EV_TO_HARTREE = None
-    _HARTREE_TO_EV = None
-
-
-def _ha_to_ev(value_ha):
-    """Convert Hartree → eV via cclib's converter for use in test mocks."""
-    return _cclib_convertor(value_ha, "hartree", "eV")
-
 
 @pytest.fixture
 def water():
@@ -165,6 +150,24 @@ def _patch_cclib(ccdata):
     mock_ccopen = MagicMock()
     mock_ccopen.return_value.parse.return_value = ccdata
     return patch("cclib.io.ccopen", mock_ccopen)
+
+
+def _g16_log(scf="-76.0105049953", scf_label="RHF", method=None, body="", archive="", pre=""):
+    """Minimal Gaussian log: SCF Done line, extra body lines, archive entry, normal termination.
+
+    ``archive`` is appended to the archive's Version= section after ``HF=``,
+    e.g. ``"\\MP2=-76.2284380"``; ``method`` is the archive method label
+    (defaults to ``scf_label``).
+    """
+    method = method or scf_label
+    return (
+        f"{pre}"
+        f" SCF Done:  E({scf_label}) =  {scf}     A.U. after   10 cycles\n"
+        f"{body}"
+        f" 1\\1\\GINC-HOST\\SP\\{method}\\STO-3G\\H2O1\\USER\\13-Oct-2026\\0\\\\#P\\\\t\\\\0,1\\O,0,0.,0.,0.\\\\"
+        f"Version=ES64L-G16RevC.01\\HF={float(scf):.7f}{archive}\\RMSD=1.000e-09\\PG=C02V\\\\@\n"
+        " Normal termination of Gaussian 16 at Tue Oct 13 12:00:00 2026.\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -363,23 +366,24 @@ def test_build_com_file_trailing_blank_line():
 
 
 # rq-db92093a
-def test_build_input_memory_rounds_down_minimum_1(water_energy_input, harness):
+def test_build_input_memory_has_floor(water_energy_input, harness):
     from qcengine.config import TaskConfig
 
-    cfg = TaskConfig(scratch_directory=None, scratch_messy=False, ncores=1, nnodes=1, memory=0.5, retries=0, mpiexec_command=None)
+    cfg = TaskConfig(scratch_directory=None, scratch_messy=False, ncores=1, nnodes=1, memory=0.05, retries=0, mpiexec_command=None)
     with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/usr/local/g16/g16"):
         job = harness.build_input(water_energy_input, cfg)
-    assert "%Mem=1GB" in job["infiles"]["gaussian.com"]
+    assert "%Mem=100MB" in job["infiles"]["gaussian.com"]
 
 
 # rq-4ad16d95
-def test_build_input_memory_whole_gb(water_energy_input, harness):
+def test_build_input_memory_leaves_headroom(water_energy_input, harness):
     from qcengine.config import TaskConfig
 
     cfg = TaskConfig(scratch_directory=None, scratch_messy=False, ncores=4, nnodes=1, memory=8.0, retries=0, mpiexec_command=None)
     with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/usr/local/g16/g16"):
         job = harness.build_input(water_energy_input, cfg)
-    assert "%Mem=8GB" in job["infiles"]["gaussian.com"]
+    # 90% of 8 GiB, in MB
+    assert "%Mem=7372MB" in job["infiles"]["gaussian.com"]
 
 
 # rq-0aa99076
@@ -519,7 +523,7 @@ def test_get_version_unparseable_raises(harness):
 # Tests: runner.GaussianHarness.compute() — error dispatch
 # ---------------------------------------------------------------------------
 
-_NORMAL_LOG = "Normal termination of Gaussian 16\n"
+_NORMAL_LOG = _g16_log()
 
 
 def _mock_compute(harness, water_energy_input, log_text):
@@ -594,6 +598,52 @@ def test_compute_raises_unknown_error_on_abnormal_termination(harness, water_ene
                 with patch.object(GaussianHarness, "execute", return_value=(False, dexe)):
                     with pytest.raises(UnknownError):
                         harness.compute(water_energy_input, MagicMock())
+
+
+# Messages from real Gaussian 16 C.01 failures
+@pytest.mark.parametrize(
+    "log, error",
+    [
+        (" Convergence failure -- run terminated.\n Error termination via Lnk1e in /g16/l502.exe\n", ConvergenceError),
+        (" Atomic number out of range for 6-31G basis set.\n Error termination via Lnk1e in /g16/l301.exe\n", InputError),
+        (" Last state= \"GCL\"\n Error termination via Lnk1e in /opt/g16/l1.exe at Tue Oct 13\n", InputError),
+        (" Illegal IType or MSType generated by parse.\n Error termination via Lnk1e in /g16/l1.exe\n", InputError),
+        (" The combination of multiplicity 2 and    10 electrons is impossible.\n Error termination\n", InputError),
+        (" Small interatomic distances encountered:      2     1\n Problem with the distance matrix.\n", InputError),
+        (" Out-of-memory error in routine RdGeom-1 (IEnd=      10500090 MxCore=        131072)\n", ResourceError),
+        (" Erroneous write. Write -1 instead of 8.\n Error termination via Lnk1e in /g16/l502.exe\n", UnknownError),
+    ],
+)
+def test_compute_classifies_errors(harness, water_energy_input, log, error):
+    job_record, dexe = _mock_compute(harness, water_energy_input, log)
+    with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
+        with patch("qcengine.programs.gaussian.runner.which_import", return_value=True):
+            with patch.object(GaussianHarness, "build_input", return_value=job_record):
+                with patch.object(GaussianHarness, "execute", return_value=(False, dexe)):
+                    with pytest.raises(error):
+                        harness.compute(water_energy_input, MagicMock())
+
+
+@requires_cclib
+def test_compute_unsupported_method_raises_input_error(harness, water_energy_input):
+    log = _g16_log(method="RCID-FC", body=" EUMP2 =    -0.76010504995300D+02\n", archive="\\MP2=-76.0105050")
+    job_record, dexe = _mock_compute(harness, water_energy_input, log)
+    with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
+        with patch("qcengine.programs.gaussian.runner.which_import", return_value=True):
+            with patch.object(GaussianHarness, "build_input", return_value=job_record):
+                with patch.object(GaussianHarness, "execute", return_value=(True, dexe)):
+                    with patch.object(GaussianHarness, "get_version", return_value="16.C.01"):
+                        with _patch_cclib(_make_ccdata_with_attrs()):
+                            with pytest.raises(InputError, match="RCID-FC"):
+                                harness.compute(water_energy_input, MagicMock())
+
+
+def test_execute_keeps_gaussian_scratch_in_job_directory(harness):
+    job = {"command": ["/g16", "gaussian.com"], "infiles": {}, "scratch_directory": None, "scratch_messy": False}
+    with patch("qcengine.programs.gaussian.runner.execute", return_value=(True, {})) as mock_execute:
+        harness.execute(job)
+    assert mock_execute.call_args.kwargs["environment"]["GAUSS_SCRDIR"] == "."
+    assert "fort.7" in mock_execute.call_args.args[2]
 
 
 # ---------------------------------------------------------------------------
@@ -756,77 +806,186 @@ def _make_water_mol():
 
 
 # rq-71b27e68
-@requires_cclib
-def test_harvest_hf_energy():
-    in_mol = _make_water_mol()
-    ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
-    with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", "dummy log")
-    expected = -2041.3 * _EV_TO_HARTREE
-    assert abs(float(qcvars["HF TOTAL ENERGY"]) - expected) < 1e-8
-    assert abs(float(qcvars["CURRENT ENERGY"]) - float(qcvars["HF TOTAL ENERGY"])) < 1e-12
+def test_harvest_energies_hf():
+    qcvars = harvest_energies(_g16_log())
+    assert qcvars["CURRENT ENERGY"] == Decimal("-76.0105049953")
+    assert qcvars["HF TOTAL ENERGY"] == qcvars["SCF TOTAL ENERGY"] == qcvars["CURRENT ENERGY"]
+    assert "DFT TOTAL ENERGY" not in qcvars
 
 
 # rq-6bff3228
-@requires_cclib
-def test_harvest_dft_energy():
-    in_mol = _make_water_mol()
-    ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2082.1]))
-    with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "b3lyp", "dummy log")
-    expected = -2082.1 * _EV_TO_HARTREE
-    assert abs(float(qcvars["HF TOTAL ENERGY"]) - expected) < 1e-8
-    assert abs(float(qcvars["CURRENT ENERGY"]) - float(qcvars["HF TOTAL ENERGY"])) < 1e-12
+def test_harvest_energies_dft_has_no_hf_total():
+    qcvars = harvest_energies(_g16_log(scf="-76.4087309161", scf_label="RB3LYP"))
+    assert qcvars["CURRENT ENERGY"] == Decimal("-76.4087309161")
+    assert qcvars["DFT TOTAL ENERGY"] == qcvars["DFT FUNCTIONAL TOTAL ENERGY"] == qcvars["CURRENT ENERGY"]
+    assert "HF TOTAL ENERGY" not in qcvars
 
 
 # rq-578bb785
-@requires_cclib
-def test_harvest_mp2_energies():
-    in_mol = _make_water_mol()
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-2041.3]),
-        mpenergies=np.array([[-2044.8]]),
+def test_harvest_energies_mp2():
+    log = _g16_log(
+        scf="-74.9630231626",
+        method="RMP2-FC",
+        body=" E2 =    -0.3544594200D-01 EUMP2 =    -0.74998469104638D+02\n",
+        archive="\\MP2=-74.9984691",
     )
-    with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "mp2", "dummy log")
-    hf_h = -2041.3 * _EV_TO_HARTREE
-    mp2_h = -2044.8 * _EV_TO_HARTREE
-    assert abs(float(qcvars["HF TOTAL ENERGY"]) - hf_h) < 1e-8
-    assert abs(float(qcvars["MP2 TOTAL ENERGY"]) - mp2_h) < 1e-8
-    assert abs(float(qcvars["MP2 CORRELATION ENERGY"]) - (mp2_h - hf_h)) < 1e-8
-    assert abs(float(qcvars["CURRENT ENERGY"]) - mp2_h) < 1e-8
+    qcvars = harvest_energies(log)
+    assert qcvars["MP2 TOTAL ENERGY"] == Decimal("-74.998469104638")
+    assert qcvars["MP2 CORRELATION ENERGY"] == Decimal("-74.998469104638") - Decimal("-74.9630231626")
+    assert qcvars["CURRENT ENERGY"] == qcvars["MP2 TOTAL ENERGY"]
 
 
-# rq-1b7ae62e
-@requires_cclib
-def test_harvest_ccsd_energies():
-    in_mol = _make_water_mol()
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-2041.3]),
-        ccenergies=np.array([-2045.2]),
+_CCSD_T_BODY = (
+    " E2 =    -0.3544594200D-01 EUMP2 =    -0.74998469104637D+02\n"
+    " CCSD(T)\n"
+    " =======\n"
+    " Wavefunction amplitudes converged. E(Corr)=     -75.012383393\n"
+    " CCSD(T)= -0.75012450878D+02\n"
+)
+
+
+# rq-1b7ae62e rq-eddef743
+def test_harvest_energies_ccsd_t():
+    log = _g16_log(
+        scf="-74.9630231626",
+        method="RCCSD(T)-FC",
+        body=_CCSD_T_BODY,
+        archive="\\MP2=-74.9984691\\CCSD=-75.0123834\\CCSD(T)=-75.0124509",
     )
-    with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "ccsd", "dummy log")
-    hf_h = -2041.3 * _EV_TO_HARTREE
-    ccsd_h = -2045.2 * _EV_TO_HARTREE
-    assert abs(float(qcvars["CCSD TOTAL ENERGY"]) - ccsd_h) < 1e-8
-    assert abs(float(qcvars["CCSD CORRELATION ENERGY"]) - (ccsd_h - hf_h)) < 1e-8
-    assert abs(float(qcvars["CURRENT ENERGY"]) - ccsd_h) < 1e-8
+    qcvars = harvest_energies(log)
+    assert qcvars["CCSD TOTAL ENERGY"] == Decimal("-75.012383393")
+    assert qcvars["CCSD(T) TOTAL ENERGY"] == Decimal("-75.012450878")
+    assert qcvars["CURRENT ENERGY"] == qcvars["CCSD(T) TOTAL ENERGY"]
 
 
-# rq-eddef743
-@requires_cclib
-def test_harvest_ccsd_t_energies():
-    in_mol = _make_water_mol()
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-2041.3]),
-        ccenergies=np.array([-2045.5]),
+@pytest.mark.parametrize(
+    "method, body, archive, expected, stem",
+    [
+        (
+            "RMP3-FC",
+            " EUMP2 =    -0.74998469104637D+02\n E3=       -0.96243567D-02        EUMP3=      -0.75008093461D+02\n",
+            "\\MP2=-74.9984691\\MP3=-75.0080935",
+            "-75.008093461",
+            "MP3",
+        ),
+        (
+            "RMP4SDTQ-FC",
+            " EUMP2 =    -0.74998469104637D+02\n"
+            " E4(SDQ)=  -0.28677025D-02        UMP4(SDQ)=  -0.75010961164D+02\n"
+            " E4(SDTQ)= -0.29153588D-02        UMP4(SDTQ)= -0.75011008820D+02\n",
+            "\\MP2=-74.9984691\\MP4SDQ=-75.0109612\\MP4SDTQ=-75.0110088",
+            "-75.011008820",
+            "MP4",
+        ),
+        (
+            "RQCISD(T)-FC",
+            " EUMP2 =    -0.74998469104637D+02\n"
+            " Wavefunction amplitudes converged. E(Corr)=     -75.012400197\n"
+            " QCISD(T)= -0.75012457677D+02\n",
+            "\\MP2=-74.9984691\\QCISD=-75.0124002\\QCISD(T)=-75.0124577",
+            "-75.012457677",
+            "QCISD(T)",
+        ),
+        (
+            "RCISD-FC",
+            " EUMP2 =    -0.74998469104637D+02\n Wavefunction amplitudes converged. E(Corr)=     -75.011795318\n",
+            "\\MP2=-74.9984691\\CISD=-75.0117953",
+            "-75.011795318",
+            "CISD",
+        ),
+    ],
+)
+def test_harvest_energies_post_hf_levels(method, body, archive, expected, stem):
+    qcvars = harvest_energies(_g16_log(scf="-74.9630231626", method=method, body=body, archive=archive))
+    assert qcvars["CURRENT ENERGY"] == Decimal(expected)
+    assert qcvars[f"{stem} TOTAL ENERGY"] == Decimal(expected)
+
+
+def test_harvest_energies_open_shell_prefix():
+    log = _g16_log(
+        scf="-54.7749910183",
+        scf_label="ROHF",
+        method="ROMP2-FC",
+        body=" E2 =    -0.3136439645D-01 EUMP2 =    -0.54806355414722D+02\n",
+        archive="\\MP2=-54.8063554",
     )
-    with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "ccsd(t)", "dummy log")
-    ccsdt_h = -2045.5 * _EV_TO_HARTREE
-    assert abs(float(qcvars["CCSD(T) TOTAL ENERGY"]) - ccsdt_h) < 1e-8
-    assert abs(float(qcvars["CURRENT ENERGY"]) - ccsdt_h) < 1e-8
+    assert harvest_energies(log)["CURRENT ENERGY"] == Decimal("-54.806355414722")
+
+
+def test_harvest_energies_double_hybrid():
+    log = _g16_log(
+        scf="-75.1988324129",
+        scf_label="RB2PLYP",
+        method="RB2PLYP-FC",
+        body=" E2(B2PLYP) =    -0.1204732391D-01 E(B2PLYP) =    -0.75210879736849D+02\n",
+        archive="\\MP2=-75.2108797",
+    )
+    qcvars = harvest_energies(log)
+    assert qcvars["CURRENT ENERGY"] == Decimal("-75.210879736849")
+    assert qcvars["DFT TOTAL ENERGY"] == qcvars["CURRENT ENERGY"]
+    assert qcvars["DOUBLE-HYBRID CORRECTION ENERGY"] == Decimal("-0.01204732391")
+    assert qcvars["SCF TOTAL ENERGY"] == Decimal("-75.1988324129")
+    assert "MP2 TOTAL ENERGY" not in qcvars
+
+
+def test_harvest_energies_numerical_hessian_uses_reference_geometry():
+    """Energies after the first Forces block belong to displaced geometries."""
+    log = _g16_log(
+        scf="-74.9630231626",
+        method="RCCSD-FC",
+        body=(
+            " Wavefunction amplitudes converged. E(Corr)=     -75.012383387\n"
+            " ***** Axes restored to original set *****\n"
+            " Center     Atomic                   Forces (Hartrees/Bohr)\n"
+            " SCF Done:  E(RHF) =  -74.9630232616     A.U. after    5 cycles\n"
+            " Wavefunction amplitudes converged. E(Corr)=     -75.012487506\n"
+        ),
+        archive="\\CCSD=-75.0123834",
+    )
+    qcvars = harvest_energies(log)
+    assert qcvars["SCF TOTAL ENERGY"] == Decimal("-74.9630231626")
+    assert qcvars["CURRENT ENERGY"] == Decimal("-75.012383387")
+
+
+def test_harvest_energies_last_scf_before_reference_cut():
+    """Stable=Opt reruns the SCF at the same geometry; the last SCF is the result."""
+    log = _g16_log(
+        scf="-149.517259423",
+        scf_label="UHF",
+        pre=(
+            " SCF Done:  E(UHF) =  -149.461276695     A.U. after    8 cycles\n"
+            " SCF Done:  E(UHF) =  -149.484344617     a.u. after    5 cycles\n"
+        ),
+    )
+    assert harvest_energies(log)["CURRENT ENERGY"] == Decimal("-149.517259423")
+
+
+def test_harvest_energies_unsupported_method_raises():
+    log = _g16_log(
+        scf="-74.9630231626",
+        method="RCID-FC",
+        body=" EUMP2 =    -0.74998469104637D+02\n",
+        archive="\\MP2=-74.9984691",
+    )
+    with pytest.raises(UnsupportedMethodError, match="RCID-FC"):
+        harvest_energies(log)
+
+
+def test_harvest_energies_archive_mismatch_raises():
+    log = _g16_log(scf="-74.9630231626", archive="", method="RHF").replace("HF=-74.9630232", "HF=-74.9640232")
+    with pytest.raises(ValueError, match="disagrees with the archive"):
+        harvest_energies(log)
+
+
+def test_harvest_energies_missing_archive_raises():
+    with pytest.raises(ValueError, match="No archive entry"):
+        harvest_energies(" SCF Done:  E(RHF) =  -76.0105049953     A.U. after   10 cycles\n")
+
+
+def test_harvest_energies_missing_scf_raises():
+    log = _g16_log().replace(" SCF Done:  E(RHF) =  -76.0105049953     A.U. after   10 cycles\n", "")
+    with pytest.raises(ValueError, match="SCF Done"):
+        harvest_energies(log)
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +1003,7 @@ def test_harvest_gradient_negated():
         grads=forces[np.newaxis, :, :],
     )
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", "dummy log")
+        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
     expected = -forces.flatten()
     assert grad is not None
     np.testing.assert_allclose(grad, expected, atol=1e-12)
@@ -857,7 +1016,7 @@ def test_harvest_no_gradient_when_absent():
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     # grads is None (no attribute)
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", "dummy log")
+        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
     assert grad is None
 
 
@@ -876,7 +1035,7 @@ def test_harvest_hessian():
         hessian=hess_matrix,
     )
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", "dummy log")
+        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
     assert hess is not None
     assert hess.shape == (9, 9)
     np.testing.assert_allclose(hess, hess_matrix)
@@ -888,7 +1047,7 @@ def test_harvest_no_hessian_when_absent():
     in_mol = _make_water_mol()
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", "dummy log")
+        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
     assert hess is None
 
 
@@ -899,16 +1058,36 @@ def test_harvest_no_hessian_when_absent():
 
 # rq-4c4a1542
 @requires_cclib
-def test_harvest_dipole_moment():
+def test_harvest_dipole_from_archive():
     in_mol = _make_water_mol()
-    dipole_vec = np.array([0.0, 1.85, 0.0])
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-2041.3]),
-        moments=[None, dipole_vec],
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        qcvars, _, _, _ = harvest(in_mol, "hf", _g16_log(archive="\\Dipole=0.,0.,-0.6358857"))
+    np.testing.assert_allclose(qcvars["CURRENT DIPOLE"], [0.0, 0.0, -0.6358857])
+    np.testing.assert_allclose(qcvars["HF DIPOLE"], [0.0, 0.0, -0.6358857])
+
+
+@requires_cclib
+def test_harvest_no_dipole_for_post_hf():
+    in_mol = _make_water_mol()
+    log = _g16_log(
+        method="RMP2-FC",
+        body=" EUMP2 =    -0.76010504995300D+02\n",
+        archive="\\MP2=-76.0105050\\Dipole=0.,0.,-0.6358857",
     )
-    with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", "dummy log")
-    assert abs(float(qcvars["DIPOLE MOMENT"]) - 1.85) < 1e-6
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        qcvars, _, _, _ = harvest(in_mol, "mp2", log)
+    assert "CURRENT DIPOLE" not in qcvars
+
+
+@requires_cclib
+def test_harvest_electron_counts_from_log():
+    """cclib's homos has one entry for ROHF; the log line gives both counts."""
+    in_mol = _make_water_mol()
+    log = _g16_log(pre="    5 alpha electrons        4 beta electrons\n")
+    with _patch_cclib(_make_ccdata_with_attrs(homos=np.array([4]))):
+        qcvars, _, _, _ = harvest(in_mol, "hf", log)
+    assert qcvars["N ALPHA ELECTRONS"] == 5
+    assert qcvars["N BETA ELECTRONS"] == 4
 
 
 # rq-ffae3fa6
@@ -921,7 +1100,7 @@ def test_harvest_mulliken_charges():
         atomcharges={"mulliken": charges},
     )
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", "dummy log")
+        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
     assert "MULLIKEN CHARGES" in qcvars
     assert len(qcvars["MULLIKEN CHARGES"]) == 3
 
@@ -935,7 +1114,7 @@ def test_harvest_missing_mulliken_no_error():
         atomcharges={},
     )
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", "dummy log")
+        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
     assert "MULLIKEN CHARGES" not in qcvars
 
 
@@ -950,7 +1129,7 @@ def test_harvest_output_molecule_symbols():
     in_mol = _make_water_mol()
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", "dummy log")
+        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
     assert list(out_mol.symbols) == ["O", "H", "H"]
 
 
@@ -961,7 +1140,7 @@ def test_harvest_nre_cross_check_passes():
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     # Should not raise
     with _patch_cclib(ccdata):
-        harvest(in_mol, "hf", "dummy log")
+        harvest(in_mol, "hf", _g16_log())
 
 
 # rq-0b4cf843
@@ -976,7 +1155,7 @@ def test_harvest_nre_mismatch_raises():
     )
     with _patch_cclib(ccdata):
         with pytest.raises(ValueError, match="inconsistent"):
-            harvest(in_mol, "hf", "dummy log")
+            harvest(in_mol, "hf", _g16_log())
 
 
 # ---------------------------------------------------------------------------
@@ -994,7 +1173,7 @@ def test_harvest_no_coords_raises():
     )
     with _patch_cclib(ccdata):
         with pytest.raises(ValueError):
-            harvest(in_mol, "hf", "dummy log")
+            harvest(in_mol, "hf", _g16_log())
 
 
 # rq-bb775969
@@ -1181,7 +1360,7 @@ def test_ghost_out_mol_real_preserved():
         atomnos=np.array([2, 10]),
     )
     with _patch_cclib(ccdata):
-        _, _, _, out_mol = harvest(in_mol, "hf", "dummy log")
+        _, _, _, out_mol = harvest(in_mol, "hf", _g16_log())
     assert list(out_mol.real) == [True, False]
 
 
@@ -1195,7 +1374,7 @@ def test_ghost_out_mol_symbols_from_in_mol():
         atomnos=np.array([2, 10]),
     )
     with _patch_cclib(ccdata):
-        _, _, _, out_mol = harvest(in_mol, "hf", "dummy log")
+        _, _, _, out_mol = harvest(in_mol, "hf", _g16_log())
     assert list(out_mol.symbols) == ["He", "Ne"]
 
 
@@ -1210,7 +1389,7 @@ def test_ghost_atom_count_sanity_check_passes():
     )
     with _patch_cclib(ccdata):
         # Should not raise: 2 atoms in cclib output == 2 atoms in in_mol
-        harvest(in_mol, "hf", "dummy log")
+        harvest(in_mol, "hf", _g16_log())
 
 
 # rq-66067019
@@ -1225,7 +1404,7 @@ def test_ghost_atom_count_mismatch_raises():
     )
     with _patch_cclib(ccdata):
         with pytest.raises(ValueError, match="atom count"):
-            harvest(in_mol, "hf", "dummy log")
+            harvest(in_mol, "hf", _g16_log())
 
 
 # rq-a69d0898
@@ -1239,7 +1418,7 @@ def test_ghost_nre_check_excludes_ghosts():
     )
     with _patch_cclib(ccdata):
         # NRE = 0 for both (single real atom), no ValueError
-        harvest(in_mol, "hf", "dummy log")
+        harvest(in_mol, "hf", _g16_log())
 
 
 # rq-b57c882b
@@ -1268,7 +1447,7 @@ def test_ghost_nre_mismatch_still_raises():
     )
     with _patch_cclib(ccdata):
         with pytest.raises(ValueError, match="inconsistent"):
-            harvest(in_mol, "hf", "dummy log")
+            harvest(in_mol, "hf", _g16_log())
 
 
 # rq-e5a98119
@@ -1278,7 +1457,7 @@ def test_ghost_nre_check_unchanged_for_all_real():
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     with _patch_cclib(ccdata):
         # Existing behaviour: no ghosts, full-mol NRE comparison, no raise
-        harvest(in_mol, "hf", "dummy log")
+        harvest(in_mol, "hf", _g16_log())
 
 
 # rq-d97cc860
@@ -1294,7 +1473,7 @@ def test_ghost_gradient_spans_real_and_ghost():
         grads=forces[np.newaxis, :, :],
     )
     with _patch_cclib(ccdata):
-        _, grad, _, _ = harvest(in_mol, "hf", "dummy log")
+        _, grad, _, _ = harvest(in_mol, "hf", _g16_log())
     assert grad is not None
     assert grad.shape == (6,)
     # Ghost atom (index 1) gradient is zero
@@ -1324,7 +1503,7 @@ def test_ghost_align_uses_generic_ghosts():
 
     with _patch_cclib(ccdata):
         with patch.object(HarvesterMolecule, "align", spy_align):
-            harvest(in_mol, "hf", "dummy log")
+            harvest(in_mol, "hf", _g16_log())
 
     assert captured["calls"], "expected at least one Molecule.align call"
     assert all(call.get("generic_ghosts") is True for call in captured["calls"])
@@ -1401,19 +1580,18 @@ def test_tricky_ghost_nosymm_emitted_bare():
 # rq-2cb2c5c0
 @requires_cclib
 def test_tricky_ghost_mp2_full_harvested_as_mp2():
-    """harvest() normalises method 'mp2(full)' to 'mp2' so MP2 qcvars are populated."""
+    """An MP2(Full) job ("RMP2-Full" in the archive) populates the MP2 qcvars."""
     in_mol = _make_water_mol()
-    log_with_mp2 = "EUMP2 =    -0.76276030623D+02\n"
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-2041.3]),
-        mpenergies=np.array([[-2044.8]]),
+    log = _g16_log(
+        scf="-74.9630231626",
+        method="RMP2-Full",
+        body=" E2 =    -0.3554565274D-01 EUMP2 =    -0.74998568815099D+02\n",
+        archive="\\MP2=-74.9985688",
     )
-    with _patch_cclib(ccdata):
-        qcvars, _, _, _ = harvest(in_mol, "mp2(full)", log_with_mp2)
-    assert "MP2 TOTAL ENERGY" in qcvars
-    assert "MP2 CORRELATION ENERGY" in qcvars
-    # CURRENT ENERGY should be the MP2 total (highest level)
-    assert abs(float(qcvars["CURRENT ENERGY"]) - float(qcvars["MP2 TOTAL ENERGY"])) < 1e-12
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        qcvars, _, _, _ = harvest(in_mol, "mp2(full)", log)
+    assert qcvars["MP2 TOTAL ENERGY"] == Decimal("-74.998568815099")
+    assert qcvars["CURRENT ENERGY"] == qcvars["MP2 TOTAL ENERGY"]
 
 
 # ---------------------------------------------------------------------------
@@ -1517,7 +1695,7 @@ def test_atom_labels_out_mol_preserves_labels_when_fixed():
         atomnos=np.array([1, 1, 1, 1]),
     )
     with _patch_cclib(ccdata):
-        _, _, _, out_mol = harvest(mol, "hf", "dummy log")
+        _, _, _, out_mol = harvest(mol, "hf", _g16_log())
     assert list(out_mol.atom_labels) == ["", "5", "_other", "_4sq"]
 
 
@@ -1701,243 +1879,113 @@ def test_dispersion_method_suffix_only(harness, water):
 # Tests: empirical dispersion (harvester)
 # ---------------------------------------------------------------------------
 
-
-_DISP_SCF_HA = -76.4014123456
-_DISP_DISP_HA = -0.0046617305
-
-
-def _disp_ccdata(scf_ha=_DISP_SCF_HA, disp_ha=_DISP_DISP_HA, disp_present=True):
-    """Build a mock ccdata for B3LYP-D3-like calculations.
-
-    Both energies are stored in eV via cclib's converter, so harvest()'s
-    inverse cclib.parser.utils.convertor("eV", "hartree") recovers the
-    original Hartree values exactly.
-    """
-    ccdata = _make_ccdata_with_attrs(scfenergies=np.array([_ha_to_ev(scf_ha)]))
-    if disp_present:
-        ccdata.dispersionenergies = np.array([_ha_to_ev(disp_ha)])
-    return ccdata
+# B3LYP-D3(BJ)/6-31G* water: Gaussian's SCF Done energy already includes the
+# dispersion term printed on the "Dispersion energy=" line.
+_DISP_SCF = "-76.4093047918"
+_DISP_D = "-0.0005738757"
+_DISP_LOG = _g16_log(
+    scf=_DISP_SCF,
+    scf_label="RB3LYP",
+    pre=f" R6Disp:  Grimme-D3(BJ) Dispersion energy=       {_DISP_D} Hartrees.\n",
+)
 
 
 # rq-1d5da737
-@requires_cclib
-def test_dispersion_harvest_no_dispersionenergies_no_qcvars():
-    """When ccdata has no dispersionenergies attribute, no dispersion qcvars are set."""
-    in_mol = _make_water_mol()
-    with _patch_cclib(_disp_ccdata(disp_present=False)):
-        qcvars, _, _, _ = harvest(in_mol, "b3lyp-d3", "")
+def test_dispersion_harvest_not_double_counted():
+    qcvars = harvest_energies(_DISP_LOG)
+    assert qcvars["CURRENT ENERGY"] == Decimal(_DISP_SCF)
+    assert qcvars["SCF TOTAL ENERGY"] == Decimal(_DISP_SCF)
+    assert qcvars["DFT TOTAL ENERGY"] == Decimal(_DISP_SCF)
+    assert qcvars["DISPERSION CORRECTION ENERGY"] == Decimal(_DISP_D)
+    assert qcvars["DFT FUNCTIONAL TOTAL ENERGY"] == Decimal(_DISP_SCF) - Decimal(_DISP_D)
+
+
+# rq-1d5da737
+def test_dispersion_harvest_functional_qcvars_from_suffix():
+    qcvars = harvest_energies(_DISP_LOG, functional_label="B3LYP", dispersion_level="D3(BJ)")
+    assert qcvars["B3LYP-D3(BJ) DISPERSION CORRECTION ENERGY"] == Decimal(_DISP_D)
+    assert qcvars["B3LYP-D3(BJ) TOTAL ENERGY"] == Decimal(_DISP_SCF)
+    assert qcvars["B3LYP FUNCTIONAL TOTAL ENERGY"] == Decimal(_DISP_SCF) - Decimal(_DISP_D)
+
+
+# rq-1d5da737
+def test_dispersion_harvest_no_suffix_generic_qcvars_only():
+    """Dispersion from a user EmpiricalDispersion keyword: no formal label is known."""
+    qcvars = harvest_energies(_DISP_LOG)
+    assert not any(k.endswith("DISPERSION CORRECTION ENERGY") and k != "DISPERSION CORRECTION ENERGY" for k in qcvars)
+
+
+# rq-1d5da737
+def test_dispersion_harvest_absent_no_qcvars():
+    qcvars = harvest_energies(_g16_log(scf="-76.4087309161", scf_label="RB3LYP"))
     assert "DISPERSION CORRECTION ENERGY" not in qcvars
-    assert "B3LYP-D3 DISPERSION CORRECTION ENERGY" not in qcvars
 
 
 # rq-1d5da737
 @requires_cclib
-def test_dispersion_harvest_qcvars_from_cclib():
-    """Dispersion energy is read from ccdata.dispersionenergies and emitted under
-    both the generic and functional-specific qcvar keys."""
+def test_dispersion_harvest_suffix_reaches_qcvars():
     in_mol = _make_water_mol()
-    with _patch_cclib(_disp_ccdata()):
-        qcvars, _, _, _ = harvest(in_mol, "b3lyp-d3", "")
-    assert abs(float(qcvars["DISPERSION CORRECTION ENERGY"]) - _DISP_DISP_HA) < 1e-12
-    assert "B3LYP-D3 DISPERSION CORRECTION ENERGY" in qcvars
-    assert abs(float(qcvars["B3LYP-D3 DISPERSION CORRECTION ENERGY"]) - _DISP_DISP_HA) < 1e-12
-
-
-# rq-1d5da737
-@requires_cclib
-def test_dispersion_harvest_functional_total_excludes_dispersion():
-    in_mol = _make_water_mol()
-    with _patch_cclib(_disp_ccdata()):
-        qcvars, _, _, _ = harvest(in_mol, "b3lyp-d3", "")
-    assert abs(float(qcvars["B3LYP FUNCTIONAL TOTAL ENERGY"]) - _DISP_SCF_HA) < 1e-10
-    assert abs(float(qcvars["B3LYP-D3 TOTAL ENERGY"]) - (_DISP_SCF_HA + _DISP_DISP_HA)) < 1e-10
-    assert abs(float(qcvars["CURRENT ENERGY"]) - (_DISP_SCF_HA + _DISP_DISP_HA)) < 1e-10
-
-
-# rq-1d5da737
-@requires_cclib
-def test_dispersion_harvest_d3bj_uses_parenthesised_label():
-    in_mol = _make_water_mol()
-    with _patch_cclib(_disp_ccdata(disp_ha=-0.007)):
-        qcvars, _, _, _ = harvest(in_mol, "b3lyp-d3bj", "")
-    assert "B3LYP-D3(BJ) DISPERSION CORRECTION ENERGY" in qcvars
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        qcvars, _, _, _ = harvest(in_mol, "b3lyp-d3bj", _DISP_LOG)
     assert "B3LYP-D3(BJ) TOTAL ENERGY" in qcvars
 
 
 # rq-1d5da737
 @requires_cclib
-def test_dispersion_harvest_scf_hf_unchanged():
-    in_mol = _make_water_mol()
-    with _patch_cclib(_disp_ccdata()):
-        qcvars, _, _, _ = harvest(in_mol, "b3lyp-d3", "")
-    # SCF TOTAL ENERGY / HF TOTAL ENERGY excludes the dispersion contribution
-    assert abs(float(qcvars["HF TOTAL ENERGY"]) - _DISP_SCF_HA) < 1e-10
-    assert abs(float(qcvars["SCF TOTAL ENERGY"]) - _DISP_SCF_HA) < 1e-10
-
-
-# rq-1d5da737
-@requires_cclib
-def test_dispersion_harvest_method_without_suffix_no_functional_qcvars():
-    """If user passes EmpiricalDispersion via keyword (no method suffix), generic qcvars only."""
-    in_mol = _make_water_mol()
-    with _patch_cclib(_disp_ccdata()):
-        qcvars, _, _, _ = harvest(in_mol, "b3lyp", "")
-    assert "DISPERSION CORRECTION ENERGY" in qcvars
-    # No formal dash label known → no functional-specific qcvars
-    assert "B3LYP-D3 DISPERSION CORRECTION ENERGY" not in qcvars
-    assert "B3LYP-D3 TOTAL ENERGY" not in qcvars
-    # CURRENT ENERGY still reflects scf + disp for DFT
-    assert abs(float(qcvars["CURRENT ENERGY"]) - (_DISP_SCF_HA + _DISP_DISP_HA)) < 1e-10
-
-
-# rq-1d5da737
-@requires_cclib
-def test_dispersion_harvest_absent_no_qcvars():
-    in_mol = _make_water_mol()
-    # ccdata has scfenergies but no dispersionenergies attribute
-    ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2079.3]))
-    with _patch_cclib(ccdata):
-        qcvars, _, _, _ = harvest(in_mol, "b3lyp", "")
-    assert "DISPERSION CORRECTION ENERGY" not in qcvars
-    assert abs(float(qcvars["CURRENT ENERGY"]) - float(qcvars["SCF TOTAL ENERGY"])) < 1e-12
-
-
-# rq-1d5da737
-@requires_cclib
-def test_dispersion_harvest_nlc_method_no_dispersion_qcvars():
-    """wB97M-V is self-consistent NLC; cclib's dispersionenergies attribute is absent."""
-    in_mol = _make_water_mol()
-    ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2079.3]))
-    with _patch_cclib(ccdata):
-        qcvars, _, _, _ = harvest(in_mol, "wb97m-v", "")
-    assert "DISPERSION CORRECTION ENERGY" not in qcvars
-
-
-# rq-1d5da737
-@requires_cclib
 def test_dispersion_harvest_gradient_unchanged():
-    """Dispersion in ccdata doesn't disturb the gradient pipeline; cclib's grads is the total."""
+    """cclib's grads is the total (dispersion-inclusive) force."""
     in_mol = _make_water_mol()
     forces = np.array([[0.01, 0.0, -0.02], [0.0, 0.005, 0.01], [0.0, -0.005, 0.01]])
-    ccdata = _disp_ccdata()
-    ccdata.grads = forces[np.newaxis, :, :]
+    ccdata = _make_ccdata_with_attrs(grads=forces[np.newaxis, :, :])
     with _patch_cclib(ccdata):
-        qcvars, grad, _, _ = harvest(in_mol, "b3lyp-d3", "")
-    assert grad is not None
+        _, grad, _, _ = harvest(in_mol, "b3lyp-d3bj", _DISP_LOG)
     np.testing.assert_allclose(grad, -forces.flatten(), atol=1e-12)
 
 
 # ---------------------------------------------------------------------------
-# Tests: cclib-only energy extraction (error and consistency)
+# Tests: punch file (Punch=Derivatives)
 # ---------------------------------------------------------------------------
 
 
-def _make_ccdata_without(*attrs):
-    """Build a ccdata mock and delete the named attributes (to simulate missing cclib data)."""
-    ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2079.3]))
-    for a in attrs:
-        if hasattr(ccdata, a):
-            delattr(ccdata, a)
-    return ccdata
+def _punch(values):
+    return " archive copy\\\\@\n" + "\n".join(f"   {v:.10E}".replace("E", "D") for v in values) + "\n"
 
 
-# rq-c20746b1
+def test_parse_punch_gradient_and_hessian():
+    grad = np.arange(1, 4, dtype=float) * 0.01
+    tri = np.arange(1, 7, dtype=float) * 0.1  # 3x3 lower triangle, row-wise
+    g, h = _parse_punch(_punch(list(grad) + list(tri)), 1)
+    np.testing.assert_allclose(g, grad.reshape(1, 3))
+    np.testing.assert_allclose(h, [[0.1, 0.2, 0.4], [0.2, 0.3, 0.5], [0.4, 0.5, 0.6]])
+
+
+def test_parse_punch_archive_wrapped_inside_terminator():
+    """The archive copy can wrap between the two characters of its closing "\\\\@"."""
+    grad = [0.01, 0.02, 0.03]
+    punch = "1\\1\\GINC-HOST\\SP\\RHF\\STO-3G\\0,1\\H,0,0.,0.,0.\\\\\n@\n" + _punch(grad).split("\n", 1)[1]
+    g, h = _parse_punch(punch, 1)
+    np.testing.assert_allclose(g, [grad])
+    assert h is None
+
+
+def test_parse_punch_without_derivatives():
+    assert _parse_punch(" archive copy\\\\@\n", 1) == (None, None)
+
+
+def test_parse_punch_bad_count_raises():
+    with pytest.raises(ValueError, match="Unexpected number"):
+        _parse_punch(_punch([0.1, 0.2]), 1)
+
+
 @requires_cclib
-def test_cclib_only_missing_scfenergies_raises():
+def test_harvest_hessian_prefers_punch_file():
     in_mol = _make_water_mol()
-    ccdata = _make_ccdata_without("scfenergies")
-    with _patch_cclib(ccdata):
-        with pytest.raises(ValueError, match=r"scfenergies"):
-            harvest(in_mol, "hf", "")
-
-
-# rq-c20746b1
-@requires_cclib
-def test_cclib_only_empty_scfenergies_raises():
-    in_mol = _make_water_mol()
-    ccdata = _make_ccdata_with_attrs(scfenergies=np.array([]))
-    with _patch_cclib(ccdata):
-        with pytest.raises(ValueError, match=r"scfenergies"):
-            harvest(in_mol, "hf", "")
-
-
-# rq-c20746b1
-@requires_cclib
-def test_cclib_only_missing_mpenergies_raises_for_mp2():
-    in_mol = _make_water_mol()
-    ccdata = _make_ccdata_without("mpenergies")  # scfenergies kept
-    with _patch_cclib(ccdata):
-        with pytest.raises(ValueError, match=r"mpenergies"):
-            harvest(in_mol, "mp2", "")
-
-
-# rq-c20746b1
-@requires_cclib
-def test_cclib_only_missing_ccenergies_raises_for_ccsd():
-    in_mol = _make_water_mol()
-    ccdata = _make_ccdata_without("ccenergies")
-    with _patch_cclib(ccdata):
-        with pytest.raises(ValueError, match=r"ccenergies"):
-            harvest(in_mol, "ccsd", "")
-
-
-# rq-c20746b1
-@requires_cclib
-def test_cclib_only_missing_ccenergies_raises_for_ccsd_t():
-    in_mol = _make_water_mol()
-    ccdata = _make_ccdata_without("ccenergies")
-    with _patch_cclib(ccdata):
-        with pytest.raises(ValueError, match=r"ccenergies"):
-            harvest(in_mol, "ccsd(t)", "")
-
-
-# rq-c20746b1
-@requires_cclib
-def test_cclib_only_scf_round_trips_within_1_ulp():
-    """The Ha → eV → Ha round-trip through cclib's convertor must be ≤ 1 ULP."""
-    in_mol = _make_water_mol()
-    scf_ha = -76.0571491640
-    ccdata = _make_ccdata_with_attrs(scfenergies=np.array([_ha_to_ev(scf_ha)]))
-    with _patch_cclib(ccdata):
-        qcvars, _, _, _ = harvest(in_mol, "hf", "")
-    # The round-trip should be exact to within a single ULP of the magnitude.
-    import math
-    delta = abs(float(qcvars["HF TOTAL ENERGY"]) - scf_ha)
-    assert delta <= math.ulp(scf_ha) * 4  # generous: 4 ULPs
-
-
-# rq-c20746b1
-@requires_cclib
-def test_cclib_only_mp2_total_from_mpenergies_last():
-    in_mol = _make_water_mol()
-    scf_ha = -76.05
-    mp2_ha = -76.30
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([_ha_to_ev(scf_ha)]),
-        mpenergies=np.array([[_ha_to_ev(mp2_ha)]]),
-    )
-    with _patch_cclib(ccdata):
-        qcvars, _, _, _ = harvest(in_mol, "mp2", "")
-    assert abs(float(qcvars["MP2 TOTAL ENERGY"]) - mp2_ha) < 1e-12
-    assert abs(float(qcvars["MP2 CORRELATION ENERGY"]) - (mp2_ha - scf_ha)) < 1e-12
-
-
-# rq-c20746b1 rq-eddef743
-@requires_cclib
-def test_cclib_only_ccsd_t_does_not_emit_ccsd_qcvar():
-    """For a CCSD(T) job, cclib only stores the CCSD(T) total; no CCSD qcvar surfaces."""
-    in_mol = _make_water_mol()
-    scf_ha = -76.05
-    ccsdt_ha = -76.32
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([_ha_to_ev(scf_ha)]),
-        ccenergies=np.array([_ha_to_ev(ccsdt_ha)]),
-    )
-    with _patch_cclib(ccdata):
-        qcvars, _, _, _ = harvest(in_mol, "ccsd(t)", "")
-    assert "CCSD(T) TOTAL ENERGY" in qcvars
-    assert "CCSD TOTAL ENERGY" not in qcvars
-    assert abs(float(qcvars["CCSD(T) TOTAL ENERGY"]) - ccsdt_ha) < 1e-12
+    hess = np.arange(81, dtype=float).reshape(9, 9) * 1.0e-3
+    hess = hess + hess.T
+    punch = _punch(list(np.zeros(9)) + list(hess[np.tril_indices(9)]))
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        _, _, out_hess, _ = harvest(in_mol, "hf", _g16_log(), punch)
+    np.testing.assert_allclose(out_hess, hess)
 
 
 # ---------------------------------------------------------------------------
@@ -1999,24 +2047,25 @@ def test_gaussian_b3lyp_d3_water(water):
     assert "B3LYP-D3 DISPERSION CORRECTION ENERGY" in qcvars
     assert "B3LYP-D3 TOTAL ENERGY" in qcvars
     assert "B3LYP FUNCTIONAL TOTAL ENERGY" in qcvars
-    # Empirical reference values (Gaussian 16, Revision C.02). Tolerance is loose
-    # enough to absorb minor patch-level variation in the D3 parameter set.
+    # Empirical reference values (Gaussian 16). Gaussian's SCF Done energy
+    # (-76.4087263383) already includes the dispersion term; plain B3LYP/6-31G*
+    # is -76.4087184463. Tolerance absorbs patch-level D3 parameter variation.
     atol = 1.0e-6
-    ref_func = -76.4087263383
+    ref_total = -76.4087263383
     ref_disp = -0.0000078919
-    ref_total = ref_func + ref_disp
+    ref_func = ref_total - ref_disp
     assert abs(float(qcvars["B3LYP FUNCTIONAL TOTAL ENERGY"]) - ref_func) < atol
     assert abs(float(qcvars["B3LYP-D3 DISPERSION CORRECTION ENERGY"]) - ref_disp) < atol
     assert abs(float(qcvars["B3LYP-D3 TOTAL ENERGY"]) - ref_total) < atol
-    # SCF + dispersion == total (numerical consistency).
-    scf = float(qcvars["B3LYP FUNCTIONAL TOTAL ENERGY"])
+    # functional + dispersion == total (numerical consistency).
+    func = float(qcvars["B3LYP FUNCTIONAL TOTAL ENERGY"])
     disp = float(qcvars["B3LYP-D3 DISPERSION CORRECTION ENERGY"])
     tot = float(qcvars["B3LYP-D3 TOTAL ENERGY"])
-    assert abs((scf + disp) - tot) < 1.0e-10
-    # CURRENT ENERGY is the dispersion-corrected total.
+    assert abs((func + disp) - tot) < 1.0e-10
+    # CURRENT ENERGY and SCF TOTAL ENERGY are the dispersion-corrected total (Psi4 convention).
     assert abs(float(qcvars["CURRENT ENERGY"]) - tot) < 1.0e-10
-    # SCF TOTAL ENERGY / HF TOTAL ENERGY exclude dispersion.
-    assert abs(float(qcvars["SCF TOTAL ENERGY"]) - scf) < 1.0e-10
+    assert abs(float(qcvars["SCF TOTAL ENERGY"]) - tot) < 1.0e-10
+    assert "HF TOTAL ENERGY" not in qcvars
 
 
 # ---------------------------------------------------------------------------
@@ -2043,10 +2092,10 @@ def test_gaussian_hessian_hf_water(water):
     hess = np.asarray(result.return_result)
     atol = 1.0e-6
     assert hess.shape == (9, 9)
-    assert abs(np.trace(hess) - 3.2315247000) < atol
-    assert abs(np.linalg.norm(hess) - 2.2444460940) < atol
-    assert abs(hess[0, 0] - (-0.0560541000)) < atol
-    assert abs(hess[3, 3] - (-0.0223351000)) < atol
+    assert abs(np.trace(hess) - 3.2315230546) < atol
+    assert abs(np.linalg.norm(hess) - 2.2444454404) < atol
+    assert abs(hess[0, 0] - (-0.0560540960)) < atol
+    assert abs(hess[3, 3] - (-0.0223351423)) < atol
     assert abs(hess[0, 1]) < 1.0e-10
     assert np.allclose(hess, hess.T, atol=1.0e-10)
 
@@ -2072,7 +2121,7 @@ def test_gaussian_properties_hf_water(water):
     atol = 1.0e-6
     assert abs(float(qcvars["HF TOTAL ENERGY"]) - (-74.962963201)) < atol
     # Dipole magnitude (Debye) — looser tol absorbs Gaussian rounding in the log.
-    assert abs(float(qcvars["DIPOLE MOMENT"]) - 1.7252) < 1.0e-3
+    np.testing.assert_allclose(result.properties.scf_dipole_moment, [0.0, 0.0, -0.6787514], atol=1.0e-7)
     mulliken = list(qcvars["MULLIKEN CHARGES"])
     assert len(mulliken) == 3
     assert abs(sum(float(q) for q in mulliken)) < 1.0e-4
@@ -2101,8 +2150,9 @@ def test_gaussian_dft_b3lyp_water(water):
 
     qcvars = result.extras["qcvars"]
     # The SCF energy IS the B3LYP energy when no dispersion is requested.
-    assert abs(float(qcvars["HF TOTAL ENERGY"]) - ref) < 1.0e-10
+    assert abs(float(qcvars["DFT TOTAL ENERGY"]) - ref) < 1.0e-10
     assert abs(float(qcvars["CURRENT ENERGY"]) - ref) < 1.0e-10
+    assert "HF TOTAL ENERGY" not in qcvars
     # No dispersion qcvars when the method has no dispersion suffix.
     assert "DISPERSION CORRECTION ENERGY" not in qcvars
     assert "B3LYP-D3 DISPERSION CORRECTION ENERGY" not in qcvars
@@ -2136,8 +2186,8 @@ def test_gaussian_b3lyp_d3_gradient_water(water):
     qcvars = result.extras["qcvars"]
     atol = 1.0e-6
     assert abs(float(qcvars["B3LYP-D3 DISPERSION CORRECTION ENERGY"]) - (-0.0000078919)) < atol
-    assert abs(float(qcvars["B3LYP FUNCTIONAL TOTAL ENERGY"]) - (-76.4087263383)) < atol
-    assert abs(float(qcvars["B3LYP-D3 TOTAL ENERGY"]) - (-76.4087342302)) < atol
+    assert abs(float(qcvars["B3LYP FUNCTIONAL TOTAL ENERGY"]) - (-76.4087184464)) < atol
+    assert abs(float(qcvars["B3LYP-D3 TOTAL ENERGY"]) - (-76.4087263383)) < atol
 
 
 # rq-d06d7266
@@ -2223,8 +2273,8 @@ def test_gaussian_b3lyp_d3_hessian_water(water):
     hess = np.asarray(result.return_result)
     atol = 1.0e-6
     assert hess.shape == (9, 9)
-    assert abs(np.trace(hess) - 2.3626060600) < atol
-    assert abs(np.linalg.norm(hess) - 1.5979941261) < atol
+    assert abs(np.trace(hess) - 2.3626048438) < atol
+    assert abs(np.linalg.norm(hess) - 1.5979933610) < atol
     assert np.allclose(hess, hess.T, atol=1.0e-10)
 
     qcvars = result.extras["qcvars"]
@@ -2444,3 +2494,147 @@ def test_gaussian_bse_matches_psi4(water):
     gau = run("gaussian", {})
     psi = run("psi4", {"scf_type": "pk"})
     assert abs(gau.return_result - psi.return_result) < 1.0e-8
+
+
+# ---------------------------------------------------------------------------
+# Route keyword formatting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "keywords, expected",
+    [
+        ({"NoSymm": None}, "NoSymm"),
+        ({"NoSymm": True}, "NoSymm"),
+        ({"SCF": ["Tight", "XQC"]}, "SCF=(Tight,XQC)"),
+        ({"Integral": {"Grid": "UltraFine", "Acc2E": 12}}, "Integral=(Grid=UltraFine,Acc2E=12)"),
+        ({"Integral": {"NoXCTest": None, "Grid": 99590}}, "Integral=(NoXCTest,Grid=99590)"),
+        ({"MaxDisk": 0}, "MaxDisk=0"),
+    ],
+)
+def test_build_route_line_keyword_formats(keywords, expected):
+    assert build_route_line("HF", "STO-3G", "", {}, keywords) == f"#P HF/STO-3G {expected}"
+
+
+def test_build_route_line_false_value_raises():
+    with pytest.raises(InputError, match="no off form"):
+        build_route_line("HF", "STO-3G", "", {}, {"NoSymm": False})
+
+
+@pytest.mark.parametrize("keyword", ["Freq", "opt", "Force", "IRC", "Scan"])
+def test_build_route_line_job_type_keyword_raises(keyword):
+    with pytest.raises(InputError, match="job type"):
+        build_route_line("HF", "STO-3G", "Force=NoStep", {}, {keyword: ""})
+
+
+def test_build_route_line_user_keyword_replaces_harness_extra():
+    line = build_route_line("HF", "STO-3G", "", {"Pop": "Full"}, {"pop": "NBO"})
+    assert line == "#P HF/STO-3G pop=NBO"
+
+
+def test_build_input_hessian_requests_punch(harness, water):
+    inp = AtomicInput(molecule=water, specification=_spec(driver="hessian"))
+    with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
+        com = harness.build_input(inp, _default_taskconfig())["infiles"]["gaussian.com"]
+    assert [ln for ln in com.splitlines() if ln.startswith("#P")] == ["#P HF/STO-3G Freq Punch=Derivatives"]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: method coverage, frames, errors
+# ---------------------------------------------------------------------------
+
+_PSI4_FC = {"scf_type": "pk", "freeze_core": True, "d_convergence": 10, "e_convergence": 10}
+
+
+def _cc_water():
+    return Molecule.from_data("O 0 0 0.1173\nH 0 0.7572 -0.4692\nH 0 -0.7572 -0.4692")
+
+
+@using("gaussian")
+@using("psi4")
+@pytest.mark.parametrize(
+    "method, psi4_keywords",
+    [
+        ("mp3", {"mp_type": "conv"}),
+        ("mp4", {"qc_module": "fnocc"}),
+        ("qcisd(t)", {"qc_module": "fnocc"}),
+        ("ccsd(t)", {}),
+        ("cisd", {"qc_module": "detci"}),
+    ],
+)
+def test_gaussian_post_hf_matches_psi4(method, psi4_keywords):
+    """Gaussian's default frozen core, matched in Psi4."""
+    import qcengine as qcng
+
+    def run(program, keywords):
+        inp = AtomicInput(molecule=_cc_water(), specification=AtomicSpecification(program=program, driver="energy", model={"method": method, "basis": "cc-pvdz"}, keywords=keywords))
+        return qcng.compute(inp, program, raise_error=True)
+
+    assert abs(run("gaussian", {}).return_result - run("psi4", {**_PSI4_FC, **psi4_keywords}).return_result) < 1.0e-7
+
+
+@using("gaussian")
+def test_gaussian_double_hybrid_total_energy():
+    """B2PLYP returns the double-hybrid total, not the SCF part."""
+    import qcengine as qcng
+
+    inp = AtomicInput(molecule=_cc_water(), specification=AtomicSpecification(program="gaussian", driver="energy", model={"method": "b2plyp", "basis": "sto-3g"}))
+    qcvars = qcng.compute(inp, "gaussian", raise_error=True).extras["qcvars"]
+    assert abs(float(qcvars["CURRENT ENERGY"]) - (-75.210879736849)) < 1.0e-8
+    assert abs(float(qcvars["SCF TOTAL ENERGY"]) - (-75.1988324129)) < 1.0e-8
+
+
+@using("gaussian")
+def test_gaussian_unsupported_method_raises():
+    import qcengine as qcng
+
+    inp = AtomicInput(molecule=_cc_water(), specification=AtomicSpecification(program="gaussian", driver="energy", model={"method": "cid", "basis": "sto-3g"}))
+    with pytest.raises(InputError, match="RCID"):
+        qcng.compute(inp, "gaussian", raise_error=True)
+
+
+@using("gaussian")
+def test_gaussian_numerical_hessian_energy_is_reference():
+    """CCSD Freq differentiates numerically; the energy must be the reference-geometry one."""
+    import qcengine as qcng
+
+    def run(driver):
+        inp = AtomicInput(molecule=_cc_water(), specification=AtomicSpecification(program="gaussian", driver=driver, model={"method": "ccsd", "basis": "sto-3g"}))
+        return qcng.compute(inp, "gaussian", raise_error=True)
+
+    assert abs(run("hessian").properties.return_energy - run("energy").properties.return_energy) < 1.0e-8
+
+
+@using("gaussian")
+@using("psi4")
+@pytest.mark.parametrize("driver", ["gradient", "hessian"])
+def test_gaussian_rotated_molecule_matches_psi4(driver):
+    """Off-axis molecule in a fixed frame: derivatives and dipole come back in the input frame."""
+    import qcengine as qcng
+
+    mol = Molecule.from_data("O 0.31 -0.42 0.27\nH 1.12 -0.05 0.71\nH -0.29 0.19 0.68\nunits angstrom\nno_com\nno_reorient")
+
+    def run(program, keywords):
+        inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program=program, driver=driver, model={"method": "hf", "basis": "6-31g*"}, keywords=keywords))
+        return qcng.compute(inp, program, raise_error=True)
+
+    gau, psi = run("gaussian", {}), run("psi4", {"scf_type": "pk", "d_convergence": 10, "e_convergence": 10})
+    np.testing.assert_allclose(gau.return_result, psi.return_result, atol=5.0e-8)
+    np.testing.assert_allclose(gau.properties.scf_dipole_moment, psi.properties.scf_dipole_moment, atol=1.0e-6)
+
+
+@using("gaussian")
+@pytest.mark.parametrize(
+    "molstr, basis, keywords, error",
+    [
+        ("O 0 0 0.1173\nH 0 0.7572 -0.4692\nH 0 -0.7572 -0.4692", "6-31g", {"SCF": {"MaxCycle": 2}}, ConvergenceError),
+        ("H 0 0 0\nI 0 0 1.61", "6-31g", {}, InputError),
+        ("O 0 0 0.1173\nH 0 0.7572 -0.4692\nH 0 -0.7572 -0.4692", "sto-3g", {"NotAKeyword": ""}, InputError),
+    ],
+)
+def test_gaussian_real_errors_classified(molstr, basis, keywords, error):
+    import qcengine as qcng
+
+    inp = AtomicInput(molecule=Molecule.from_data(molstr), specification=AtomicSpecification(program="gaussian", driver="energy", model={"method": "hf", "basis": basis}, keywords=keywords))
+    with pytest.raises(error):
+        qcng.compute(inp, "gaussian", raise_error=True)

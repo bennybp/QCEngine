@@ -136,6 +136,9 @@ def muster_modelchem(method: str, driver: str, multiplicity: int) -> Dict[str, A
     extra_keywords: Dict[str, str] = {}
     if driver == "properties":
         extra_keywords["Pop"] = "Full"
+    elif driver == "hessian":
+        # fort.7 holds the Cartesian Hessian to 10 significant figures (the log has 6)
+        extra_keywords["Punch"] = "Derivatives"
 
     # rq-0c1b5066 — empirical dispersion: emit the Gaussian route keyword and
     # surface dispersion_level/functional_name so downstream code (harvester,
