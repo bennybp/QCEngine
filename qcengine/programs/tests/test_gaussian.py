@@ -3028,18 +3028,34 @@ def test_gaussian_heavy_and_near_symmetric_molecules(symbols, geometry, fixed_fr
     np.testing.assert_allclose(gau.return_result, psi.return_result, atol=1.0e-7)
 
 
-def test_sanitize_for_cclib_merged_orientation_columns():
+_COORD_CASES = [(500.0, -1000.0, -1500.1173), (9999.999996, 19999.999991, 30000.117287), (-9999.5, 99999.25, -0.5), (0.0, -1.5, 2.25)]
+
+
+def _orientation_row(coords):
+    return "      1          8           0    " + "".join(f"{c:12.6f}" for c in coords)
+
+
+@pytest.mark.parametrize("coords", _COORD_CASES)
+def test_sanitize_for_cclib_merged_orientation_columns(coords):
     from qcengine.programs.gaussian.harvester import _sanitize_for_cclib
 
-    row = "      1          8           0      500.000000-1000.000000-1500.117300\n"
-    assert _sanitize_for_cclib(row) == "      1          8           0      500.000000 -1000.000000 -1500.117300\n"
+    header = (
+        "                          Input orientation:\n"
+        " ---------------------------------------------------------------------\n"
+        " Center     Atomic      Atomic             Coordinates (Angstroms)\n"
+        " Number     Number       Type             X           Y           Z\n"
+        " ---------------------------------------------------------------------\n"
+    )
+    log = header + _orientation_row(coords) + "\n ---------------------------------------------------------------------\n"
+    row = _sanitize_for_cclib(log).splitlines()[5]
+    assert [float(v) for v in row.split()[-3:]] == pytest.approx(coords)
 
 
-def test_atom_table_merged_columns():
-    from qcengine.programs.gaussian.harvester import _atom_table
+@pytest.mark.parametrize("coords", _COORD_CASES)
+def test_atom_table_fixed_width_fields(coords):
+    from qcengine.programs.gaussian.harvester import ORIENTATION_FIELD, _atom_table
 
-    block = "      1          8           0      500.000000-1000.000000 1500.117300"
-    np.testing.assert_allclose(_atom_table(block, 1), [[500.0, -1000.0, 1500.1173]])
+    np.testing.assert_allclose(_atom_table(_orientation_row(coords), 1, ORIENTATION_FIELD), [coords])
 
 
 def test_build_route_line_units_keyword_raises():
@@ -3049,17 +3065,27 @@ def test_build_route_line_units_keyword_raises():
 
 @using("gaussian")
 @using("psi4")
-def test_gaussian_charged_dipole_origin():
+@pytest.mark.parametrize(
+    "molstr, gaussian_basis, psi4_basis, psi4_keywords",
+    [
+        ("1 1\nHe 0.43 -0.31 0.22\nH 0.43 -0.31 1.0", "sto-3g", "sto-3g", {}),
+        # ECP on I: the origin still uses the full nuclear charge
+        ("1 2\nH 0.43 -0.31 0.22\nI 0.43 -0.31 1.83", "def2SVP", "def2-svp", {"reference": "uhf"}),
+    ],
+    ids=["HeH+", "HI+ ECP"],
+)
+def test_gaussian_charged_dipole_origin(molstr, gaussian_basis, psi4_basis, psi4_keywords):
     """Gaussian's dipole origin is the center of nuclear charge; QCSchema's is the coordinate origin."""
     import qcengine as qcng
 
-    mol = Molecule.from_data("1 1\nHe 0.43 -0.31 0.22\nH 0.43 -0.31 1.0\nunits angstrom\nno_com\nno_reorient")
+    mol = Molecule.from_data(molstr + "\nunits angstrom\nno_com\nno_reorient")
 
-    def run(program, keywords):
-        inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program=program, driver="properties", model={"method": "hf", "basis": "sto-3g"}, keywords=keywords))
+    def run(program, basis, keywords):
+        inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program=program, driver="properties", model={"method": "hf", "basis": basis}, keywords=keywords))
         return qcng.compute(inp, program, raise_error=True)
 
-    gau, psi = run("gaussian", {}), run("psi4", {"scf_type": "pk", "d_convergence": 10})
+    gau = run("gaussian", gaussian_basis, {})
+    psi = run("psi4", psi4_basis, {"scf_type": "pk", "d_convergence": 10, **psi4_keywords})
     np.testing.assert_allclose(gau.properties.scf_dipole_moment, psi.properties.scf_dipole_moment, atol=1.0e-6)
 
 

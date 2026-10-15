@@ -10,6 +10,8 @@ from qcelemental.models.v2 import Molecule
 from qcengine.programs.gaussian.harvester import (
     _ALPHA_BETA_RE,
     _FORCES_RE,
+    FORCES_FIELD,
+    ORIENTATION_FIELD,
     _atom_table,
     _parse_archive,
     archive_geometry,
@@ -67,12 +69,12 @@ def harvest_optimization(in_mol: Molecule, method: str, log_content: str) -> Lis
     steps = []
     for i, seg in enumerate(segments):
         last = i == len(segments) - 1
-        geometry = _atom_table(_GEOMETRY_RE.search(seg).group(1), natom)
+        geometry = _atom_table(_GEOMETRY_RE.search(seg).group(1), natom, ORIENTATION_FIELD)
         if last:
             if np.abs(final_geometry - geometry).max() > _FINAL_GEOMETRY_ATOL:
                 raise ValueError("Gaussian archive geometry does not match the last optimization step.")
             geometry = final_geometry
-        forces = _atom_table(_FORCES_RE.search(seg).group(1), natom)
+        forces = _atom_table(_FORCES_RE.search(seg).group(1), natom, FORCES_FIELD)
 
         ref_text = seg[: seg.find("Forces (Hartrees/Bohr)")]
         qcvars = harvest_energies(

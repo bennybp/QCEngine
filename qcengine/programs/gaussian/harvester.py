@@ -3,7 +3,7 @@
 import io
 import re
 from decimal import Decimal
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import qcelemental as qcel
@@ -54,21 +54,31 @@ _ARCHIVE_ATOL = 2.0e-6
 # and Gaussian's own symmetrization moves atoms by < 1e-8 Angstrom
 _GEOMETRY_ATOL = 1.0e-5
 
-_DECIMAL_RE = re.compile(r"-?\d+\.\d+")
 _STANDARD_ORIENTATION_RE = re.compile(r"Standard orientation:\s*\n\s*-+\n.*?\n.*?\n\s*-+\n(.*?)\n\s*-+", re.S)
-# fixed-width orientation-table row whose coordinate columns ran together
-_MERGED_COLUMNS_RE = re.compile(r"^(\s+\d+\s+\d+\s+\d+\s+.*?\.\d{6})(?=-)", re.M)
+_ORIENTATION_TABLE_RE = re.compile(r"((?:Input|Standard) orientation:\s*\n\s*-+\n.*?\n.*?\n\s*-+\n)(.*?)(\n\s*-+)", re.S)
+
+# Gaussian's fixed-width fields for the last three columns of per-atom tables:
+# orientation tables (F12.6) and forces (F15.9). Large values fill the field,
+# so neighboring fields can run together without a space.
+ORIENTATION_FIELD = 12
+FORCES_FIELD = 15
 
 _FORCES_RE = re.compile(r"Forces \(Hartrees/Bohr\)\s*\n.*?\n\s*-+\n(.*?)\n\s*-+", re.S)
 
 
-def _atom_table(block: str, natom: int) -> np.ndarray:
+def _fixed_fields(line: str, width: int) -> List[str]:
+    """The last three fixed-width fields of a table row."""
+    line = line.rstrip()
+    return [line[len(line) - (3 - i) * width : len(line) - (2 - i) * width] for i in range(3)]
+
+
+def _atom_table(block: str, natom: int, width: int) -> np.ndarray:
     """Last three columns of a Gaussian per-atom table (geometry or forces), (natom, 3).
 
-    Reads the decimal numbers of each row, so fixed-width columns that run
-    together (large coordinates, e.g. "500.000000-1000.000000") still parse.
+    Reads them as fixed-width fields of ``width`` characters, so values that fill
+    their field and run together (e.g. far-translated molecules) still parse.
     """
-    rows = [_DECIMAL_RE.findall(line)[-3:] for line in block.strip().splitlines()]
+    rows = [_fixed_fields(line, width) for line in block.strip("\n").splitlines()]
     if len(rows) != natom:
         raise ValueError(f"Expected {natom} atoms in a Gaussian table, found {len(rows)}.")
     return np.array(rows, dtype=float)
@@ -108,10 +118,15 @@ def _sanitize_for_cclib(log_content: str) -> str:
     tables run together for large coordinates; the harness uses neither.
     """
     text = _ROTCONST_LINE_RE.sub(lambda m: re.sub(r"\*{2,}", "inf", m.group(0)), log_content)
-    previous = None
-    while previous != text:  # a row may have two merged boundaries
-        previous, text = text, _MERGED_COLUMNS_RE.sub(r"\1 ", text)
-    return text
+
+    def separate(m: re.Match) -> str:
+        rows = []
+        for line in m.group(2).split("\n"):
+            head = line.rstrip()[: -3 * ORIENTATION_FIELD]
+            rows.append(" ".join([head] + [f.strip() for f in _fixed_fields(line, ORIENTATION_FIELD)]))
+        return m.group(1) + "\n".join(rows) + m.group(3)
+
+    return _ORIENTATION_TABLE_RE.sub(separate, text)
 
 
 class UnsupportedMethodError(Exception):
@@ -449,7 +464,7 @@ def harvest(
     # interatomic distances of the first (reference) standard orientation with the input.
     standard = _STANDARD_ORIENTATION_RE.search(log_content)
     if standard:
-        calc = _atom_table(standard.group(1), natoms)
+        calc = _atom_table(standard.group(1), natoms, ORIENTATION_FIELD)
         ref = in_mol.geometry.reshape(-1, 3) * bohr_to_angstrom
         dist = lambda g: np.linalg.norm(g[:, None, :] - g[None, :, :], axis=-1)  # noqa: E731
         deviation = np.abs(dist(calc) - dist(ref)).max()
@@ -484,7 +499,7 @@ def harvest(
     grad: Optional[np.ndarray] = None
     forces_blocks = _FORCES_RE.findall(log_content)
     if forces_blocks:
-        grad = -_atom_table(forces_blocks[-1], natoms).flatten()
+        grad = -_atom_table(forces_blocks[-1], natoms, FORCES_FIELD).flatten()
 
     # --- Hessian ---
     # rq-f2e32162 rq-344f3432 rq-f8ce079b — punch file (10 significant figures),
