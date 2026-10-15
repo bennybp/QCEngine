@@ -138,6 +138,8 @@ def harvest_energies(
     log_content: str,
     functional_label: Optional[str] = None,
     dispersion_level: Optional[str] = None,
+    ref_text: Optional[str] = None,
+    check_archive: bool = True,
 ) -> PreservingDict:
     """Extract energies at the reference geometry from a Gaussian log.
 
@@ -147,6 +149,10 @@ def harvest_energies(
     before the first gradient printout (later SCF/post-SCF blocks belong to
     the displaced geometries of a numerical Hessian), and are cross-checked
     against the archive values.
+
+    ``ref_text`` replaces that reference section (e.g. one optimization step);
+    ``check_archive=False`` skips the comparison with the archive values, which
+    belong to the final geometry.
 
     Raises
     ------
@@ -161,11 +167,16 @@ def harvest_energies(
         raise ValueError("No HF= energy found in the Gaussian archive entry.")
     family = _method_family(method)
 
-    ref_end = _ARCHIVE_START_RE.search(log_content).start()
-    forces_at = log_content.find(_FORCES_MARKER)
-    if forces_at != -1:
-        ref_end = min(ref_end, forces_at)
-    ref_text = log_content[:ref_end]
+    if ref_text is None:
+        ref_end = _ARCHIVE_START_RE.search(log_content).start()
+        forces_at = log_content.find(_FORCES_MARKER)
+        if forces_at != -1:
+            ref_end = min(ref_end, forces_at)
+        ref_text = log_content[:ref_end]
+
+    def archive_check(label: str, value: Decimal) -> None:
+        if check_archive:
+            _check_archive(label, value, archive)
 
     # Last SCF before the reference cut: Stable=Opt reruns the SCF at the same geometry.
     scf_matches = _SCF_DONE_RE.findall(ref_text)
@@ -173,7 +184,7 @@ def harvest_energies(
         raise ValueError("No 'SCF Done' line found in the Gaussian log.")
     scf_label, scf_text = scf_matches[-1]
     scf = _decimal(scf_text)
-    _check_archive("HF", scf, archive)
+    archive_check("HF", scf)
 
     # Gaussian includes empirical dispersion in the SCF Done energy.
     disp_matches = _DISPERSION_RE.findall(ref_text)
@@ -197,7 +208,7 @@ def harvest_energies(
                     raise ValueError(f"Could not find the full-precision {label} energy in the Gaussian log.")
                 continue
             value = _decimal(matches[0])
-            _check_archive(label, value, archive)
+            archive_check(label, value)
             qcvars[f"{stem} TOTAL ENERGY"] = value
             qcvars[f"{stem} CORRELATION ENERGY"] = value - scf
             if label == family:
@@ -228,7 +239,7 @@ def harvest_energies(
                 raise ValueError(f"Could not find the double-hybrid energy for '{method}' in the Gaussian log.")
             _, e2_text, total_text = dh[0]
             current = _decimal(total_text)
-            _check_archive("MP2", current, archive)
+            archive_check("MP2", current)
             qcvars["DOUBLE-HYBRID CORRECTION ENERGY"] = _decimal(e2_text)
         qcvars["DFT TOTAL ENERGY"] = current
         qcvars["DFT FUNCTIONAL TOTAL ENERGY"] = scf if disp is None else scf - disp

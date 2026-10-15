@@ -8,6 +8,7 @@ from ..exceptions import InputError, ResourceError
 from .berny import BernyProcedure
 from .geometric import GeometricProcedure
 from .model import ProcedureHarness
+from .gaussian_opt import GaussianDriverProcedure
 from .nwchem_opt import NWChemDriverProcedure
 from .optking import OptKingProcedure
 from .qcmanybody import QCManyBodyProcedure
@@ -72,4 +73,5 @@ register_procedure(OptKingProcedure())
 register_procedure(BernyProcedure())
 register_procedure(QCManyBodyProcedure())
 register_procedure(NWChemDriverProcedure())
+register_procedure(GaussianDriverProcedure())
 register_procedure(TorsionDriveProcedure())

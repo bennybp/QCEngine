@@ -2865,3 +2865,115 @@ def test_harmonic_analysis_matches_psi4_implementation(project_rot):
         np.testing.assert_allclose(np.asarray(ours[ours_key])[:, vib], np.asarray(ref[ref_key].data)[:, vib], atol=1.0e-10)
     for ours_key, ref_key in (("mu", "mu"), ("k", "k"), ("dq0", "DQ0"), ("qtp0", "Qtp0"), ("xtp0", "Xtp0"), ("theta_vib", "theta_vib"), ("infrared_intensity", "IR_intensity"), ("degeneracy", "degeneracy")):
         np.testing.assert_allclose(np.asarray(ours[ours_key])[vib], np.asarray(ref[ref_key].data)[vib], rtol=1.0e-9, atol=1.0e-10)
+
+
+# ---------------------------------------------------------------------------
+# GaussianDriver: Gaussian's own optimizer
+# ---------------------------------------------------------------------------
+
+_DISTORTED_WATER = "O 0.31 -0.42 0.27\nH 1.12 -0.05 0.71\nH -0.29 0.19 0.68\nunits angstrom\nno_com\nno_reorient"
+
+
+def _opt_input(keywords=None, program="gaussian", method="hf", protocols=None):
+    from qcelemental.models.v2 import OptimizationInput
+
+    return OptimizationInput(
+        initial_molecule=Molecule.from_data(_DISTORTED_WATER),
+        specification={
+            "keywords": keywords or {},
+            "protocols": protocols or {"trajectory_results": "all"},
+            "specification": {"driver": "gradient", "program": program, "model": {"method": method, "basis": "6-31G*"}},
+        },
+    )
+
+
+def test_build_input_opt_route(harness, water):
+    from qcengine.programs.gaussian.runner import OPT_EXTRAS_KEY
+
+    def route(opt_options):
+        spec = _spec(driver="gradient").model_copy(update={"extras": {OPT_EXTRAS_KEY: opt_options}})
+        with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
+            com = harness.build_input(AtomicInput(molecule=water, specification=spec), _default_taskconfig())["infiles"]["gaussian.com"]
+        return [ln for ln in com.splitlines() if ln.startswith("#P")]
+
+    assert route({}) == ["#P HF/STO-3G Opt NoSymm"]
+    assert route({"MaxCycles": 50, "Tight": ""}) == ["#P HF/STO-3G Opt=(MaxCycles=50,Tight) NoSymm"]
+
+
+def test_gaussiandriver_registered():
+    import qcengine as qcng
+
+    assert "gaussiandriver" in qcng.list_all_procedures()
+
+
+@using("gaussian")
+def test_gaussiandriver_rejects_other_programs():
+    import qcengine as qcng
+
+    with pytest.raises(InputError, match="only works with Gaussian"):
+        qcng.compute(_opt_input(program="psi4"), "gaussiandriver", raise_error=True)
+
+
+@using("gaussian")
+@using("geometric")
+def test_gaussiandriver_matches_geometric():
+    """Gaussian's optimizer reaches the same minimum as geomeTRIC on Gaussian gradients, in the input frame."""
+    import qcengine as qcng
+
+    inp = _opt_input(keywords={"Tight": ""})
+    native = qcng.compute(inp, "gaussiandriver", raise_error=True)
+    geom = qcng.compute(
+        _opt_input(keywords={"coordsys": "tric", "convergence_set": "gau_tight"}), "geometric", raise_error=True
+    )
+    assert native.success and native.provenance.creator == "GaussianDriver"
+    assert abs(native.properties.return_energy - geom.properties.return_energy) < 1.0e-7
+    fm, gm = native.final_molecule, geom.final_molecule
+    assert abs(fm.measure([0, 1]) - gm.measure([0, 1])) < 2.0e-4
+    assert abs(fm.measure([1, 0, 2]) - gm.measure([1, 0, 2])) < 2.0e-2
+
+    traj = native.trajectory_results
+    assert native.properties.optimization_iterations == len(traj) > 1
+    # input frame: the first step is the input geometry, the molecule keeps its frame flags
+    np.testing.assert_allclose(traj[0].molecule.geometry, inp.initial_molecule.geometry, atol=1.0e-5)
+    assert fm.fix_com and fm.fix_orientation
+    assert traj[-1].properties.return_energy == native.properties.return_energy
+    rms = [float(np.sqrt(np.mean(np.square(t.return_result)))) for t in traj]
+    assert rms[-1] < 1.0e-4 < rms[0]
+
+
+@using("gaussian")
+def test_gaussiandriver_step_matches_single_point():
+    """Energy and gradient of the final step equal a Gaussian gradient calculation at that geometry.
+
+    The single point also uses NoSymm: the DFT grid follows the molecular orientation, so
+    Gaussian's standard orientation would change the energy at the 1e-7 Eh level.
+    """
+    import qcengine as qcng
+
+    native = qcng.compute(_opt_input(method="b3lyp-d3bj"), "gaussiandriver", raise_error=True)
+    final = native.trajectory_results[-1]
+    sp = qcng.compute(
+        AtomicInput(molecule=native.final_molecule, specification=AtomicSpecification(program="gaussian", driver="gradient", model={"method": "b3lyp-d3bj", "basis": "6-31G*"}, keywords={"NoSymm": ""})),
+        "gaussian",
+        raise_error=True,
+    )
+    assert abs(final.properties.return_energy - sp.properties.return_energy) < 1.0e-8
+    np.testing.assert_allclose(final.return_result, sp.return_result, atol=1.0e-6)
+    assert "B3LYP-D3(BJ) DISPERSION CORRECTION ENERGY" in final.extras["qcvars"]
+
+
+@using("gaussian")
+def test_gaussiandriver_max_cycles_raises_convergence_error():
+    import qcengine as qcng
+
+    with pytest.raises(ConvergenceError):
+        qcng.compute(_opt_input(keywords={"MaxCycles": 2}), "gaussiandriver", raise_error=True)
+
+
+@using("gaussian")
+def test_gaussiandriver_trajectory_protocol():
+    import qcengine as qcng
+
+    res = qcng.compute(_opt_input(protocols={"trajectory_results": "final"}), "gaussiandriver", raise_error=True)
+    assert len(res.trajectory_results) == 1
+    assert res.properties.optimization_iterations > 1

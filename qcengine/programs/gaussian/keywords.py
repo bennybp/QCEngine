@@ -12,14 +12,14 @@ _RESERVED_KEYWORDS = {"memory", "nprocs"}
 _JOB_TYPE_KEYWORDS = {"sp", "force", "freq", "opt", "irc", "ircmax", "scan", "admp", "bomd"}
 
 
-def _format_keyword(key: str, val: Any) -> str:
+def format_keyword(key: str, val: Any) -> str:
     """Format one route keyword: bare, Key=Value, or Key=(opt1,opt2,...)."""
     if val is None or val is True or val == "":
         return key
     if val is False:
         raise InputError(f"Keyword '{key}' has value False; Gaussian keywords have no off form, omit it instead.")
     if isinstance(val, dict):
-        return f"{key}=({','.join(_format_keyword(k, v) for k, v in val.items())})"
+        return f"{key}=({','.join(format_keyword(k, v) for k, v in val.items())})"
     if isinstance(val, (list, tuple)):
         return f"{key}=({','.join(str(v) for v in val)})"
     return f"{key}={val}"
@@ -72,13 +72,13 @@ def build_route_line(
     # rq-cd0d6637
     for key, val in extra_keywords.items():
         if key.lower() not in user_keys:
-            parts.append(_format_keyword(key, val))
+            parts.append(format_keyword(key, val))
 
     # rq-7152455e rq-e7897f09
     for key, val in user_keywords.items():
         if key.lower() in _RESERVED_KEYWORDS:
             continue
-        parts.append(_format_keyword(key, val))
+        parts.append(format_keyword(key, val))
 
     return " ".join(parts)
 

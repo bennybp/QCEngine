@@ -19,7 +19,7 @@ from ..util.vibrations import harmonic_analysis, projection_flags
 from .basis import build_bse_basis, is_bse_basis
 from .germinate import muster_modelchem
 from .harvester import UnsupportedMethodError, harvest, is_normal_termination
-from .keywords import build_com_file, build_route_line
+from .keywords import build_com_file, build_route_line, format_keyword
 
 # rq-cb0f61f2
 _GAUSSIAN_EXECUTABLES = ("g16", "g09")
@@ -63,6 +63,10 @@ _ERROR_PATTERNS = (
         ),
     ),
 )
+
+# AtomicSpecification.extras key used by the GaussianDriver procedure to request
+# an Opt job (value: dict of Gaussian Opt options) instead of the driver's job type
+OPT_EXTRAS_KEY = "gaussian:opt"
 
 # Link 1 parses Link 0 and the route section, so errors there are input errors
 _LINK1_ERROR_RE = re.compile(r"Error termination via Lnk1e in \S*/l1\.exe")
@@ -266,10 +270,20 @@ class GaussianHarness(ProgramHarness):
             extra_keywords = {**extra_keywords, **{k: "" for k in bse_basis["route_keywords"]}}
             basis_block = bse_basis["basis_block"]
 
+        # GaussianDriver: Gaussian's own optimizer, in the input frame (NoSymm keeps
+        # Gaussian from reorienting the molecule and imposing its point group)
+        job_type = modelchem["job_type"]
+        opt_options = input_model.specification.extras.get(OPT_EXTRAS_KEY)
+        if opt_options is not None:
+            job_type = "Opt"
+            if opt_options:
+                job_type += f"=({','.join(format_keyword(k, v) for k, v in opt_options.items())})"
+            extra_keywords = {**extra_keywords, "NoSymm": ""}
+
         route_line = build_route_line(
             modelchem["method_string"],
             route_basis,
-            modelchem["job_type"],
+            job_type,
             extra_keywords,
             input_model.specification.keywords,
         )
