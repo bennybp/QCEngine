@@ -200,6 +200,45 @@ def test_psi4_internal_failure(schema_versions, request):
 
 
 @uusing("psi4")
+def test_psi4_vibrations():
+    from qcelemental.models.v2 import AtomicInput, Molecule
+
+    # HF/6-31G* stationary point
+    mol = Molecule.from_data(
+        "O 0 0 0.1089388120\nH 0 0.7540663912 -0.4644694052\nH 0 -0.7540663912 -0.4644694052\nunits angstrom"
+    )
+    inp = AtomicInput(
+        molecule=mol,
+        specification={
+            "driver": "hessian",
+            "model": {"method": "hf", "basis": "6-31g*"},
+            "keywords": {"scf_type": "pk", "d_convergence": 10},
+        },
+    )
+    vib = qcng.compute(inp, "psi4", raise_error=True).extras["qcvars"]["VIBRATIONS"]
+    assert vib["trv"] == ["tr"] * 6 + ["v"] * 3
+    assert np.shape(vib["x"]) == (9, 9)
+    assert compare_values([1826.554, 4070.460, 4188.705], vib["omega_in_wavenumbers"][6:], atol=1.0e-2)
+    assert compare_values([107.27, 18.21, 58.11], vib["infrared_intensity"][6:], atol=1.0e-2)
+    for key in ("q", "w", "degeneracy", "gamma", "mu", "k", "dq0", "qtp0", "xtp0", "theta_vib"):
+        assert key in vib
+
+
+@uusing("psi4")
+def test_psi4_vibrations_unprojected_rotations_off_stationary_point():
+    """As in psi4.frequency(), rotations are only projected out at stationary points."""
+    from qcelemental.models.v2 import AtomicInput, Molecule
+
+    mol = Molecule.from_data("O 0.31 -0.42 0.27\nH 1.12 -0.05 0.71\nH -0.29 0.19 0.68\nunits angstrom")
+    inp = AtomicInput(
+        molecule=mol,
+        specification={"driver": "hessian", "model": {"method": "hf", "basis": "6-31g*"}, "keywords": {"scf_type": "pk"}},
+    )
+    vib = qcng.compute(inp, "psi4", raise_error=True).extras["qcvars"]["VIBRATIONS"]
+    assert vib["trv"].count("v") == 6
+
+
+@uusing("psi4")
 @uusing("basis_set_exchange")
 def test_psi4_bse_basis(schema_versions, request):
     models, retver, _ = schema_versions

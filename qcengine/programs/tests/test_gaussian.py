@@ -239,7 +239,8 @@ def test_muster_modelchem_gradient_job_type():
 # rq-82942b90
 def test_muster_modelchem_hessian_job_type():
     result = muster_modelchem("hf", "hessian", 1)
-    assert result["job_type"] == "Freq"
+    assert result["job_type"] == "Freq=HPModes"
+    assert result["extra_keywords"] == {"Punch": "Derivatives"}
 
 
 # rq-f512b60b
@@ -1003,7 +1004,7 @@ def test_harvest_gradient_negated():
         grads=forces[np.newaxis, :, :],
     )
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
     expected = -forces.flatten()
     assert grad is not None
     np.testing.assert_allclose(grad, expected, atol=1e-12)
@@ -1016,7 +1017,7 @@ def test_harvest_no_gradient_when_absent():
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     # grads is None (no attribute)
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
     assert grad is None
 
 
@@ -1035,7 +1036,7 @@ def test_harvest_hessian():
         hessian=hess_matrix,
     )
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
     assert hess is not None
     assert hess.shape == (9, 9)
     np.testing.assert_allclose(hess, hess_matrix)
@@ -1047,7 +1048,7 @@ def test_harvest_no_hessian_when_absent():
     in_mol = _make_water_mol()
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
     assert hess is None
 
 
@@ -1061,7 +1062,7 @@ def test_harvest_no_hessian_when_absent():
 def test_harvest_dipole_from_archive():
     in_mol = _make_water_mol()
     with _patch_cclib(_make_ccdata_with_attrs()):
-        qcvars, _, _, _ = harvest(in_mol, "hf", _g16_log(archive="\\Dipole=0.,0.,-0.6358857"))
+        qcvars, _, _, _, _ = harvest(in_mol, "hf", _g16_log(archive="\\Dipole=0.,0.,-0.6358857"))
     np.testing.assert_allclose(qcvars["CURRENT DIPOLE"], [0.0, 0.0, -0.6358857])
     np.testing.assert_allclose(qcvars["HF DIPOLE"], [0.0, 0.0, -0.6358857])
 
@@ -1075,7 +1076,7 @@ def test_harvest_no_dipole_for_post_hf():
         archive="\\MP2=-76.0105050\\Dipole=0.,0.,-0.6358857",
     )
     with _patch_cclib(_make_ccdata_with_attrs()):
-        qcvars, _, _, _ = harvest(in_mol, "mp2", log)
+        qcvars, _, _, _, _ = harvest(in_mol, "mp2", log)
     assert "CURRENT DIPOLE" not in qcvars
 
 
@@ -1085,7 +1086,7 @@ def test_harvest_electron_counts_from_log():
     in_mol = _make_water_mol()
     log = _g16_log(pre="    5 alpha electrons        4 beta electrons\n")
     with _patch_cclib(_make_ccdata_with_attrs(homos=np.array([4]))):
-        qcvars, _, _, _ = harvest(in_mol, "hf", log)
+        qcvars, _, _, _, _ = harvest(in_mol, "hf", log)
     assert qcvars["N ALPHA ELECTRONS"] == 5
     assert qcvars["N BETA ELECTRONS"] == 4
 
@@ -1100,7 +1101,7 @@ def test_harvest_mulliken_charges():
         atomcharges={"mulliken": charges},
     )
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
     assert "MULLIKEN CHARGES" in qcvars
     assert len(qcvars["MULLIKEN CHARGES"]) == 3
 
@@ -1114,7 +1115,7 @@ def test_harvest_missing_mulliken_no_error():
         atomcharges={},
     )
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
     assert "MULLIKEN CHARGES" not in qcvars
 
 
@@ -1129,7 +1130,7 @@ def test_harvest_output_molecule_symbols():
     in_mol = _make_water_mol()
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
     assert list(out_mol.symbols) == ["O", "H", "H"]
 
 
@@ -1360,7 +1361,7 @@ def test_ghost_out_mol_real_preserved():
         atomnos=np.array([2, 10]),
     )
     with _patch_cclib(ccdata):
-        _, _, _, out_mol = harvest(in_mol, "hf", _g16_log())
+        _, _, _, out_mol, _ = harvest(in_mol, "hf", _g16_log())
     assert list(out_mol.real) == [True, False]
 
 
@@ -1374,7 +1375,7 @@ def test_ghost_out_mol_symbols_from_in_mol():
         atomnos=np.array([2, 10]),
     )
     with _patch_cclib(ccdata):
-        _, _, _, out_mol = harvest(in_mol, "hf", _g16_log())
+        _, _, _, out_mol, _ = harvest(in_mol, "hf", _g16_log())
     assert list(out_mol.symbols) == ["He", "Ne"]
 
 
@@ -1473,7 +1474,7 @@ def test_ghost_gradient_spans_real_and_ghost():
         grads=forces[np.newaxis, :, :],
     )
     with _patch_cclib(ccdata):
-        _, grad, _, _ = harvest(in_mol, "hf", _g16_log())
+        _, grad, _, _, _ = harvest(in_mol, "hf", _g16_log())
     assert grad is not None
     assert grad.shape == (6,)
     # Ghost atom (index 1) gradient is zero
@@ -1589,7 +1590,7 @@ def test_tricky_ghost_mp2_full_harvested_as_mp2():
         archive="\\MP2=-74.9985688",
     )
     with _patch_cclib(_make_ccdata_with_attrs()):
-        qcvars, _, _, _ = harvest(in_mol, "mp2(full)", log)
+        qcvars, _, _, _, _ = harvest(in_mol, "mp2(full)", log)
     assert qcvars["MP2 TOTAL ENERGY"] == Decimal("-74.998568815099")
     assert qcvars["CURRENT ENERGY"] == qcvars["MP2 TOTAL ENERGY"]
 
@@ -1695,7 +1696,7 @@ def test_atom_labels_out_mol_preserves_labels_when_fixed():
         atomnos=np.array([1, 1, 1, 1]),
     )
     with _patch_cclib(ccdata):
-        _, _, _, out_mol = harvest(mol, "hf", _g16_log())
+        _, _, _, out_mol, _ = harvest(mol, "hf", _g16_log())
     assert list(out_mol.atom_labels) == ["", "5", "_other", "_4sq"]
 
 
@@ -1926,7 +1927,7 @@ def test_dispersion_harvest_absent_no_qcvars():
 def test_dispersion_harvest_suffix_reaches_qcvars():
     in_mol = _make_water_mol()
     with _patch_cclib(_make_ccdata_with_attrs()):
-        qcvars, _, _, _ = harvest(in_mol, "b3lyp-d3bj", _DISP_LOG)
+        qcvars, _, _, _, _ = harvest(in_mol, "b3lyp-d3bj", _DISP_LOG)
     assert "B3LYP-D3(BJ) TOTAL ENERGY" in qcvars
 
 
@@ -1938,7 +1939,7 @@ def test_dispersion_harvest_gradient_unchanged():
     forces = np.array([[0.01, 0.0, -0.02], [0.0, 0.005, 0.01], [0.0, -0.005, 0.01]])
     ccdata = _make_ccdata_with_attrs(grads=forces[np.newaxis, :, :])
     with _patch_cclib(ccdata):
-        _, grad, _, _ = harvest(in_mol, "b3lyp-d3bj", _DISP_LOG)
+        _, grad, _, _, _ = harvest(in_mol, "b3lyp-d3bj", _DISP_LOG)
     np.testing.assert_allclose(grad, -forces.flatten(), atol=1e-12)
 
 
@@ -1984,7 +1985,7 @@ def test_harvest_hessian_prefers_punch_file():
     hess = hess + hess.T
     punch = _punch(list(np.zeros(9)) + list(hess[np.tril_indices(9)]))
     with _patch_cclib(_make_ccdata_with_attrs()):
-        _, _, out_hess, _ = harvest(in_mol, "hf", _g16_log(), punch)
+        _, _, out_hess, _, _ = harvest(in_mol, "hf", _g16_log(), punch)
     np.testing.assert_allclose(out_hess, hess)
 
 
@@ -2536,7 +2537,7 @@ def test_build_input_hessian_requests_punch(harness, water):
     inp = AtomicInput(molecule=water, specification=_spec(driver="hessian"))
     with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
         com = harness.build_input(inp, _default_taskconfig())["infiles"]["gaussian.com"]
-    assert [ln for ln in com.splitlines() if ln.startswith("#P")] == ["#P HF/STO-3G Freq Punch=Derivatives"]
+    assert [ln for ln in com.splitlines() if ln.startswith("#P")] == ["#P HF/STO-3G Freq=HPModes Punch=Derivatives"]
 
 
 # ---------------------------------------------------------------------------
@@ -2638,3 +2639,127 @@ def test_gaussian_real_errors_classified(molstr, basis, keywords, error):
     inp = AtomicInput(molecule=Molecule.from_data(molstr), specification=AtomicSpecification(program="gaussian", driver="energy", model={"method": "hf", "basis": basis}, keywords=keywords))
     with pytest.raises(error):
         qcng.compute(inp, "gaussian", raise_error=True)
+
+
+# ---------------------------------------------------------------------------
+# Harmonic vibrational analysis (VIBRATIONS qcvar)
+# ---------------------------------------------------------------------------
+
+# HF/6-31G* stationary point
+_WATER_HF_631GS_EQ = """
+O  0.0000000000  0.0000000000  0.1089388120
+H  0.0000000000  0.7540663912 -0.4644694052
+H  0.0000000000 -0.7540663912 -0.4644694052
+units angstrom
+"""
+
+
+@requires_cclib
+def test_harvest_vibrations_from_cclib():
+    in_mol = _make_water_mol()
+    disps = np.zeros((3, 3, 3))
+    disps[0, 0, 2], disps[1, 1, 1], disps[2, 2, 0] = 2.0, 1.0, -3.0
+    ccdata = _make_ccdata_with_attrs(
+        vibfreqs=np.array([-150.0, 1600.0, 3800.0]),
+        vibdisps=disps,
+        vibrmasses=np.array([1.1, 1.08, 1.04]),
+        vibfconsts=np.array([0.1, 2.3, 8.9]),
+        vibirs=np.array([5.0, 80.0, 20.0]),
+        vibsyms=["B1", "A1", "A1"],
+        atommasses=np.array([15.99491, 1.00783, 1.00783]),
+    )
+    with _patch_cclib(ccdata):
+        _, _, _, _, vib = harvest(in_mol, "hf", _g16_log())
+    assert vib["omega_in_wavenumbers"] == [-150.0, 1600.0, 3800.0]
+    assert vib["trv"] == ["v", "v", "v"]
+    assert vib["gamma"] == ["B1", "A1", "A1"]
+    assert vib["mu"] == [1.1, 1.08, 1.04]
+    x = np.asarray(vib["x"])
+    assert x.shape == (9, 3)  # one column per mode
+    np.testing.assert_allclose(np.linalg.norm(x, axis=0), 1.0)
+    np.testing.assert_allclose(x[:, 1], [0, 0, 0, 0, 1, 0, 0, 0, 0])
+    np.testing.assert_allclose(np.linalg.norm(vib["q"], axis=0), 1.0)
+
+
+@requires_cclib
+def test_harvest_no_vibrations_without_freq():
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        *_, vib = harvest(_make_water_mol(), "hf", _g16_log())
+    assert vib is None
+
+
+def test_build_vibrations_layout_and_derived_modes():
+    import qcelemental as qcel
+
+    from qcengine.programs.util.vibrations import build_vibrations
+
+    masses = [16.0, 1.0]
+    x = np.zeros((6, 2))
+    x[2, 0], x[5, 0] = 0.6, -0.8  # stretch
+    x[1, 1], x[4, 1] = -0.2, 0.9797958971  # arbitrary second mode
+    vib = build_vibrations([-50.0, 3000.0], x, masses=masses, trv=["V", "V"], gamma=[None, "A1"])
+    assert list(vib)[:3] == ["omega", "omega_in_wavenumbers", "x"]
+    np.testing.assert_allclose(vib["omega"], np.array([-50.0, 3000.0]) / qcel.constants.hartree2wavenumbers)
+    assert vib["trv"] == ["v", "v"]
+    assert vib["gamma"] == ["-", "A1"]
+    # psi4 definitions: q normalized mass-weighted, w = q / sqrt(m), x = w / |w|
+    q, w = np.asarray(vib["q"]), np.asarray(vib["w"])
+    np.testing.assert_allclose(np.linalg.norm(q, axis=0), 1.0)
+    np.testing.assert_allclose(w / np.linalg.norm(w, axis=0), x / np.linalg.norm(x, axis=0), atol=1.0e-12)
+
+
+def test_build_vibrations_validates_shapes():
+    from qcengine.programs.util.vibrations import build_vibrations
+
+    with pytest.raises(ValueError, match="x has shape"):
+        build_vibrations([1.0, 2.0], np.zeros((3, 1)))
+    with pytest.raises(ValueError, match="values of mu"):
+        build_vibrations([1.0], np.ones((3, 1)), mu=[1.0, 2.0])
+    with pytest.raises(TypeError, match="Unknown Vibrations fields"):
+        build_vibrations([1.0], np.ones((3, 1)), frequencies=[1.0])
+
+
+@using("gaussian")
+@using("psi4")
+def test_gaussian_vibrations_match_psi4():
+    """At a stationary point both programs project translations/rotations; vibrations agree."""
+    import qcengine as qcng
+
+    mol = Molecule.from_data(_WATER_HF_631GS_EQ)
+
+    def run(program, keywords):
+        inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program=program, driver="hessian", model={"method": "hf", "basis": "6-31g*"}, keywords=keywords))
+        return qcng.compute(inp, program, raise_error=True).extras["qcvars"]["VIBRATIONS"]
+
+    gau = run("gaussian", {})
+    psi = run("psi4", {"scf_type": "pk", "d_convergence": 10})
+    vib = [i for i, t in enumerate(psi["trv"]) if t == "v"]
+    assert gau["trv"] == ["v"] * 3
+    np.testing.assert_allclose(gau["omega_in_wavenumbers"], np.asarray(psi["omega_in_wavenumbers"])[vib], atol=2.0e-3)
+    np.testing.assert_allclose(gau["omega"], np.asarray(psi["omega"])[vib], atol=1.0e-8)
+    for key, atol in (("mu", 2.0e-4), ("k", 2.0e-4), ("infrared_intensity", 1.0e-3)):
+        np.testing.assert_allclose(gau[key], np.asarray(psi[key])[vib], atol=atol)
+    # Gaussian prints modes to 5 decimals; signs are arbitrary
+    for key in ("x", "q", "w"):
+        np.testing.assert_allclose(np.abs(gau[key]), np.abs(np.asarray(psi[key])[:, vib]), atol=5.0e-5)
+
+
+@using("gaussian")
+@using("psi4")
+@pytest.mark.parametrize("fixed_frame", [True, False])
+def test_gaussian_normal_modes_in_result_frame(fixed_frame):
+    """Gaussian prints modes in its standard orientation; they must follow result.molecule."""
+    import qcengine as qcng
+    from qcengine.programs.psi4 import _psi4_vibrations
+
+    molstr = "O 0.31 -0.42 0.27\nH 1.12 -0.05 0.71\nH -0.29 0.19 0.68\nunits angstrom"
+    mol = Molecule.from_data(molstr + ("\nno_com\nno_reorient" if fixed_frame else ""))
+    inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program="gaussian", driver="hessian", model={"method": "hf", "basis": "6-31g*"}))
+    result = qcng.compute(inp, "gaussian", raise_error=True)
+    # independent analysis of Gaussian's own Hessian in the result frame, with rotations projected like Gaussian
+    ref = _psi4_vibrations(result.model_copy(update={"extras": {"qcvars": {"CURRENT GRADIENT": np.zeros((3, 3))}}}))
+    vib = [i for i, t in enumerate(ref["trv"]) if t == "v"]
+    gau = result.extras["qcvars"]["VIBRATIONS"]
+    np.testing.assert_allclose(gau["omega_in_wavenumbers"], np.asarray(ref["omega_in_wavenumbers"])[vib], atol=2.0e-3)
+    overlaps = np.abs(np.einsum("ij,ij->j", np.asarray(gau["x"]), np.asarray(ref["x"])[:, vib]))
+    np.testing.assert_allclose(overlaps, 1.0, atol=1.0e-6)

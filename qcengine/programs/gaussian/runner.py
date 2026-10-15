@@ -331,7 +331,7 @@ class GaussianHarness(ProgramHarness):
             method = method[len("gaussian-"):]
 
         try:
-            qcvars, grad, hess, out_mol = harvest(input_model.molecule, method, log_text, punch_text)
+            qcvars, grad, hess, out_mol, vib = harvest(input_model.molecule, method, log_text, punch_text)
         except UnsupportedMethodError as e:
             raise InputError(f"{e}\n\n{error_stamp(input_text, log_text, stderr)}") from e
         except Exception as e:
@@ -386,7 +386,10 @@ class GaussianHarness(ProgramHarness):
             "schema_version": 2,
             "input_data": input_model,
             "molecule": out_mol,
-            "extras": {**input_model.specification.extras, "qcvars": qcvars_serialised},
+            "extras": {
+                **input_model.specification.extras,
+                "qcvars": {**qcvars_serialised, **({"VIBRATIONS": vib} if vib is not None else {})},
+            },
             "native_files": native_files,
             "properties": atprop,
             "provenance": provenance,
