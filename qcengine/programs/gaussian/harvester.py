@@ -54,15 +54,30 @@ _ARCHIVE_ATOL = 2.0e-6
 # and Gaussian's own symmetrization moves atoms by < 1e-8 Angstrom
 _GEOMETRY_ATOL = 1.0e-5
 
+_DECIMAL_RE = re.compile(r"-?\d+\.\d+")
+_STANDARD_ORIENTATION_RE = re.compile(r"Standard orientation:\s*\n\s*-+\n.*?\n.*?\n\s*-+\n(.*?)\n\s*-+", re.S)
+# fixed-width orientation-table row whose coordinate columns ran together
+_MERGED_COLUMNS_RE = re.compile(r"^(\s+\d+\s+\d+\s+\d+\s+.*?\.\d{6})(?=-)", re.M)
+
 _FORCES_RE = re.compile(r"Forces \(Hartrees/Bohr\)\s*\n.*?\n\s*-+\n(.*?)\n\s*-+", re.S)
 
 
 def _atom_table(block: str, natom: int) -> np.ndarray:
-    """Last three columns of a Gaussian per-atom table (geometry or forces), (natom, 3)."""
-    rows = [line.split()[-3:] for line in block.strip().splitlines()]
+    """Last three columns of a Gaussian per-atom table (geometry or forces), (natom, 3).
+
+    Reads the decimal numbers of each row, so fixed-width columns that run
+    together (large coordinates, e.g. "500.000000-1000.000000") still parse.
+    """
+    rows = [_DECIMAL_RE.findall(line)[-3:] for line in block.strip().splitlines()]
     if len(rows) != natom:
         raise ValueError(f"Expected {natom} atoms in a Gaussian table, found {len(rows)}.")
     return np.array(rows, dtype=float)
+
+
+def _center_of_nuclear_charge(mol: Molecule) -> np.ndarray:
+    """Gaussian's dipole origin [a0]: center of the nuclear charges of the real atoms (full Z, also with ECPs)."""
+    charges = np.array([qcel.periodictable.to_Z(s) if real else 0 for s, real in zip(mol.symbols, mol.real)], dtype=float)
+    return charges @ mol.geometry.reshape(-1, 3) / charges.sum()
 
 
 def archive_geometry(log_content: str) -> np.ndarray:
@@ -89,13 +104,22 @@ def _sanitize_for_cclib(log_content: str) -> str:
     """Make overflowed fields that cclib cannot parse readable.
 
     Gaussian prints rotational constants that overflow their format (nearly
-    linear molecules) as asterisks; the harness does not use them.
+    linear molecules) as asterisks, and the coordinate columns of orientation
+    tables run together for large coordinates; the harness uses neither.
     """
-    return _ROTCONST_LINE_RE.sub(lambda m: re.sub(r"\*{2,}", "inf", m.group(0)), log_content)
+    text = _ROTCONST_LINE_RE.sub(lambda m: re.sub(r"\*{2,}", "inf", m.group(0)), log_content)
+    previous = None
+    while previous != text:  # a row may have two merged boundaries
+        previous, text = text, _MERGED_COLUMNS_RE.sub(r"\1 ", text)
+    return text
 
 
 class UnsupportedMethodError(Exception):
     """Gaussian ran a method whose energies the harvester cannot extract."""
+
+
+class GeometryChangedError(Exception):
+    """Gaussian computed at a geometry that differs from the input molecule."""
 
 
 def _parse_archive(log_content: str) -> Tuple[str, str, Dict[str, str]]:
@@ -420,6 +444,20 @@ def harvest(
             f"Gaussian's geometry differs from the input molecule by up to {deviation:.2e} Angstrom "
             "(symmetrized or reoriented?)."
         )
+    # With symmetry on, Gaussian computes in its standard orientation, possibly with a
+    # symmetrized geometry (e.g. Symmetry=Loose) that the archive does not show. Compare
+    # interatomic distances of the first (reference) standard orientation with the input.
+    standard = _STANDARD_ORIENTATION_RE.search(log_content)
+    if standard:
+        calc = _atom_table(standard.group(1), natoms)
+        ref = in_mol.geometry.reshape(-1, 3) * bohr_to_angstrom
+        dist = lambda g: np.linalg.norm(g[:, None, :] - g[None, :, :], axis=-1)  # noqa: E731
+        deviation = np.abs(dist(calc) - dist(ref)).max()
+        if deviation > _GEOMETRY_ATOL:
+            raise GeometryChangedError(
+                f"Gaussian computed at a geometry whose interatomic distances differ from the input molecule's "
+                f"by up to {deviation:.2e} Angstrom (symmetrized). Use NoSymm or tighter Symmetry options."
+            )
     return_mol = in_mol
 
     qcvars["N ATOMS"] = str(natoms)
@@ -464,6 +502,11 @@ def harvest(
     _, _, archive_items = _parse_archive(log_content)
     if "Dipole" in archive_items and "SCF TOTAL ENERGY" in qcvars and "MP2 TOTAL ENERGY" not in qcvars:
         dipole = np.array([float(x) for x in archive_items["Dipole"].split(",")])
+        # Gaussian's origin is the center of nuclear charge; QCSchema's is the
+        # coordinate origin: mu(0) = mu(P) + Q P (matters for charged molecules)
+        charge = in_mol.molecular_charge
+        if charge != 0:
+            dipole = dipole + charge * _center_of_nuclear_charge(in_mol)
         if "HF TOTAL ENERGY" in qcvars:
             qcvars["HF DIPOLE"] = dipole
         qcvars["SCF DIPOLE"] = dipole

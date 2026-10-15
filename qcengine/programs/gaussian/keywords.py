@@ -68,6 +68,8 @@ def build_route_line(
     user_keys = {key.lower() for key in user_keywords}
     for key in user_keys & _JOB_TYPE_KEYWORDS:
         raise InputError(f"Keyword '{key}' sets the Gaussian job type, which the harness derives from the driver.")
+    if "units" in user_keys:
+        raise InputError("Keyword 'Units' conflicts with the molecule, which the harness writes in Angstrom.")
 
     # rq-cd0d6637
     for key, val in extra_keywords.items():

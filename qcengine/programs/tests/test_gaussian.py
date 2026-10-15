@@ -3026,3 +3026,64 @@ def test_gaussian_heavy_and_near_symmetric_molecules(symbols, geometry, fixed_fr
     psi = run("psi4", fixed, {"scf_type": "pk", "d_convergence": 10, "puream": False})
     np.testing.assert_array_equal(gau.molecule.geometry, mol.geometry)
     np.testing.assert_allclose(gau.return_result, psi.return_result, atol=1.0e-7)
+
+
+def test_sanitize_for_cclib_merged_orientation_columns():
+    from qcengine.programs.gaussian.harvester import _sanitize_for_cclib
+
+    row = "      1          8           0      500.000000-1000.000000-1500.117300\n"
+    assert _sanitize_for_cclib(row) == "      1          8           0      500.000000 -1000.000000 -1500.117300\n"
+
+
+def test_atom_table_merged_columns():
+    from qcengine.programs.gaussian.harvester import _atom_table
+
+    block = "      1          8           0      500.000000-1000.000000 1500.117300"
+    np.testing.assert_allclose(_atom_table(block, 1), [[500.0, -1000.0, 1500.1173]])
+
+
+def test_build_route_line_units_keyword_raises():
+    with pytest.raises(InputError, match="Units"):
+        build_route_line("HF", "STO-3G", "", {}, {"Units": "Bohr"})
+
+
+@using("gaussian")
+@using("psi4")
+def test_gaussian_charged_dipole_origin():
+    """Gaussian's dipole origin is the center of nuclear charge; QCSchema's is the coordinate origin."""
+    import qcengine as qcng
+
+    mol = Molecule.from_data("1 1\nHe 0.43 -0.31 0.22\nH 0.43 -0.31 1.0\nunits angstrom\nno_com\nno_reorient")
+
+    def run(program, keywords):
+        inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program=program, driver="properties", model={"method": "hf", "basis": "sto-3g"}, keywords=keywords))
+        return qcng.compute(inp, program, raise_error=True)
+
+    gau, psi = run("gaussian", {}), run("psi4", {"scf_type": "pk", "d_convergence": 10})
+    np.testing.assert_allclose(gau.properties.scf_dipole_moment, psi.properties.scf_dipole_moment, atol=1.0e-6)
+
+
+@using("gaussian")
+def test_gaussian_symmetrized_geometry_raises():
+    """Symmetry=Loose makes Gaussian compute at a symmetrized geometry; that must not be reported for the input."""
+    import qcengine as qcng
+
+    mol = Molecule.from_data("O 0 0 0.1173\nH 0 0.7572 -0.4692\nH 0 -0.7572 -0.46925\nunits angstrom\nno_com\nno_reorient")
+    inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program="gaussian", driver="gradient", model={"method": "hf", "basis": "sto-3g"}, keywords={"Symmetry": "Loose"}))
+    with pytest.raises(InputError, match="symmetrized"):
+        qcng.compute(inp, "gaussian", raise_error=True)
+
+
+@using("gaussian")
+def test_gaussian_far_translated_molecule():
+    """Fixed-width coordinate columns run together for large coordinates."""
+    import qcengine as qcng
+
+    mol = Molecule.from_data("O 500 -1000 1500.1173\nH 500 -999.2428 1499.5308\nH 500 -1000.7572 1499.5308\nunits angstrom\nno_com\nno_reorient")
+    ref = Molecule.from_data("O 0 0 0.1173\nH 0 0.7572 -0.4692\nH 0 -0.7572 -0.4692\nunits angstrom\nno_com\nno_reorient")
+
+    def run(molecule):
+        inp = AtomicInput(molecule=molecule, specification=AtomicSpecification(program="gaussian", driver="gradient", model={"method": "hf", "basis": "sto-3g"}))
+        return qcng.compute(inp, "gaussian", raise_error=True)
+
+    np.testing.assert_allclose(run(mol).return_result, run(ref).return_result, atol=1.0e-6)

@@ -18,7 +18,7 @@ from ..util import error_stamp
 from ..util.vibrations import harmonic_analysis, projection_flags
 from .basis import build_bse_basis, is_bse_basis
 from .germinate import muster_modelchem
-from .harvester import UnsupportedMethodError, harvest, is_normal_termination
+from .harvester import GeometryChangedError, UnsupportedMethodError, harvest, is_normal_termination
 from .keywords import build_com_file, build_route_line, format_keyword
 
 # rq-cb0f61f2
@@ -352,7 +352,7 @@ class GaussianHarness(ProgramHarness):
 
         try:
             qcvars, grad, hess, out_mol, dipder = harvest(input_model.molecule, method, log_text, punch_text)
-        except UnsupportedMethodError as e:
+        except (UnsupportedMethodError, GeometryChangedError) as e:
             raise InputError(f"{e}\n\n{error_stamp(input_text, log_text, stderr)}") from e
         except Exception as e:
             raise UnknownError(error_stamp(input_text, log_text, stderr)) from e
