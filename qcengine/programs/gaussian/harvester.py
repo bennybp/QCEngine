@@ -55,8 +55,10 @@ class UnsupportedMethodError(Exception):
     """Gaussian ran a method whose energies the harvester cannot extract."""
 
 
-def _parse_archive(log_content: str) -> Tuple[str, Dict[str, str]]:
-    """Return (method, {key: value}) from the last archive entry in the log.
+def _parse_archive(log_content: str) -> Tuple[str, str, Dict[str, str]]:
+    """Return (method, basis, {key: value}) from the last archive entry in the log.
+
+    Semiempirical jobs have basis "ZDO".
 
     Values are the raw strings of the "Version=" section, e.g. "HF" -> "-76.0105"
     or "Dipole" -> "0.,0.,-0.6358857".
@@ -69,7 +71,7 @@ def _parse_archive(log_content: str) -> Tuple[str, Dict[str, str]]:
     text = re.sub(r"\n ", "", text[: end if end != -1 else len(text)])
     sections = text.split("\\\\")
     fields = sections[0].split("\\")
-    if len(fields) < 5:
+    if len(fields) < 6:
         raise ValueError("Malformed archive entry in the Gaussian log.")
 
     items = {}
@@ -78,7 +80,7 @@ def _parse_archive(log_content: str) -> Tuple[str, Dict[str, str]]:
             for item in section.split("\\"):
                 key, _, value = item.partition("=")
                 items[key] = value
-    return fields[4], items
+    return fields[4], fields[5], items
 
 
 def _parse_punch(punch_content: str, natoms: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -154,7 +156,7 @@ def harvest_energies(
     ValueError
         If the log is incomplete or inconsistent.
     """
-    method, items = _parse_archive(log_content)
+    method, archive_basis, items = _parse_archive(log_content)
     archive = {k: Decimal(v) for k, v in items.items() if k == "HF" or k in _CORRELATED_LEVELS}
     if "HF" not in archive:
         raise ValueError("No HF= energy found in the Gaussian archive entry.")
@@ -206,8 +208,15 @@ def harvest_energies(
                 f"Gaussian ran method '{method}', whose energy the Gaussian harness cannot extract. "
                 f"Supported post-HF levels: {sorted(_CORRELATED_LEVELS)}."
             )
+    elif archive_basis == "ZDO":
+        # semiempirical (e.g. PM6): no HF or DFT qcvars
+        if any(label in archive for label in _CORRELATED_LEVELS):
+            raise UnsupportedMethodError(
+                f"Gaussian ran method '{method}' with post-SCF levels the Gaussian harness cannot extract."
+            )
+        current = scf
     else:
-        # DFT or another non-HF SCF (e.g. semiempirical)
+        # DFT
         if any(label in archive for label in _CORRELATED_LEVELS if label != "MP2"):
             raise UnsupportedMethodError(
                 f"Gaussian ran method '{method}' with post-SCF levels the Gaussian harness cannot extract."
@@ -367,9 +376,12 @@ def harvest(
         real_flags = None
 
     # rq-f1d712bb — preserve ghost designation on calc_mol so its NRE excludes ghosts
+    # Gaussian keeps the input atom order; carry over masses (isotopes are passed via Iso=)
     calc_mol_kwargs = dict(
         symbols=symbols,
         geometry=coords_bohr.flatten(),
+        masses=in_mol.masses,
+        mass_numbers=in_mol.mass_numbers,
         fix_com=True,
         fix_orientation=True,
     )
@@ -484,7 +496,7 @@ def harvest(
     # rq-c7fd08b5 rq-943856cc rq-53f8ed12 rq-4c4a1542 rq-ffae3fa6
     # The archive dipole is in a.u. and the input orientation. For post-SCF
     # gradients it may come from a correlated density, so only SCF methods report it.
-    _, archive_items = _parse_archive(log_content)
+    _, _, archive_items = _parse_archive(log_content)
     if "Dipole" in archive_items and "SCF TOTAL ENERGY" in qcvars and "MP2 TOTAL ENERGY" not in qcvars:
         dipole = np.array([float(x) for x in archive_items["Dipole"].split(",")])
         if not (in_mol.fix_com and in_mol.fix_orientation):

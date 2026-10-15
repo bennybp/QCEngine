@@ -152,7 +152,7 @@ def _patch_cclib(ccdata):
     return patch("cclib.io.ccopen", mock_ccopen)
 
 
-def _g16_log(scf="-76.0105049953", scf_label="RHF", method=None, body="", archive="", pre=""):
+def _g16_log(scf="-76.0105049953", scf_label="RHF", method=None, body="", archive="", pre="", basis="STO-3G"):
     """Minimal Gaussian log: SCF Done line, extra body lines, archive entry, normal termination.
 
     ``archive`` is appended to the archive's Version= section after ``HF=``,
@@ -164,7 +164,7 @@ def _g16_log(scf="-76.0105049953", scf_label="RHF", method=None, body="", archiv
         f"{pre}"
         f" SCF Done:  E({scf_label}) =  {scf}     A.U. after   10 cycles\n"
         f"{body}"
-        f" 1\\1\\GINC-HOST\\SP\\{method}\\STO-3G\\H2O1\\USER\\13-Oct-2026\\0\\\\#P\\\\t\\\\0,1\\O,0,0.,0.,0.\\\\"
+        f" 1\\1\\GINC-HOST\\SP\\{method}\\{basis}\\H2O1\\USER\\13-Oct-2026\\0\\\\#P\\\\t\\\\0,1\\O,0,0.,0.,0.\\\\"
         f"Version=ES64L-G16RevC.01\\HF={float(scf):.7f}{archive}\\RMSD=1.000e-09\\PG=C02V\\\\@\n"
         " Normal termination of Gaussian 16 at Tue Oct 13 12:00:00 2026.\n"
     )
@@ -612,6 +612,7 @@ def test_compute_raises_unknown_error_on_abnormal_termination(harness, water_ene
         (" The combination of multiplicity 2 and    10 electrons is impossible.\n Error termination\n", InputError),
         (" Small interatomic distances encountered:      2     1\n Problem with the distance matrix.\n", InputError),
         (" Out-of-memory error in routine RdGeom-1 (IEnd=      10500090 MxCore=        131072)\n", ResourceError),
+        (" R6DS8: Unable to choose the S8 parameter, IExCor=    0 IXCFnc=  0 ScaHFX=  1.000000 IDFTD=3\n", InputError),
         (" Erroneous write. Write -1 instead of 8.\n Error termination via Lnk1e in /g16/l502.exe\n", UnknownError),
     ],
 )
@@ -961,6 +962,13 @@ def test_harvest_energies_last_scf_before_reference_cut():
     assert harvest_energies(log)["CURRENT ENERGY"] == Decimal("-149.517259423")
 
 
+def test_harvest_energies_semiempirical_not_dft():
+    qcvars = harvest_energies(_g16_log(scf="-0.0862439508", scf_label="RPM6", basis="ZDO"))
+    assert qcvars["CURRENT ENERGY"] == Decimal("-0.0862439508")
+    assert "DFT TOTAL ENERGY" not in qcvars
+    assert "HF TOTAL ENERGY" not in qcvars
+
+
 def test_harvest_energies_unsupported_method_raises():
     log = _g16_log(
         scf="-74.9630231626",
@@ -1263,9 +1271,9 @@ def test_ghost_real_atom_emits_plain_symbol(harness):
     with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
         job = harness.build_input(inp, _default_taskconfig())
     com = job["infiles"]["gaussian.com"]
-    atom_lines = [ln for ln in com.splitlines() if ln.lstrip().startswith(("H ", "H-Bq"))]
-    assert any(ln.lstrip().startswith("H ") for ln in atom_lines)
-    assert not any(ln.lstrip().startswith("H-Bq ") for ln in atom_lines)
+    atom_lines = [ln for ln in com.splitlines() if ln.lstrip().startswith(("H(", "H-Bq("))]
+    assert any(ln.lstrip().startswith("H(Iso=") for ln in atom_lines)
+    assert not any(ln.lstrip().startswith("H-Bq") for ln in atom_lines)
 
 
 # rq-916e4919
@@ -1283,7 +1291,7 @@ def test_ghost_atom_emits_bq_suffix(harness):
     with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
         job = harness.build_input(inp, _default_taskconfig())
     com = job["infiles"]["gaussian.com"]
-    assert any(ln.lstrip().startswith("H-Bq ") for ln in com.splitlines())
+    assert any(ln.lstrip().startswith("H-Bq(Iso=") for ln in com.splitlines())
 
 
 # rq-2a015edf
@@ -1293,8 +1301,8 @@ def test_ghost_mixed_real_and_ghost(harness):
     with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
         job = harness.build_input(inp, _default_taskconfig())
     lines = [ln for ln in job["infiles"]["gaussian.com"].splitlines() if ln.strip()]
-    he_idx = next(i for i, ln in enumerate(lines) if ln.lstrip().startswith("He "))
-    ne_idx = next(i for i, ln in enumerate(lines) if ln.lstrip().startswith("Ne-Bq "))
+    he_idx = next(i for i, ln in enumerate(lines) if ln.lstrip().startswith("He(Iso="))
+    ne_idx = next(i for i, ln in enumerate(lines) if ln.lstrip().startswith("Ne-Bq(Iso="))
     assert he_idx < ne_idx  # input order preserved
 
 
@@ -1633,9 +1641,9 @@ def test_atom_labels_single_labeled_h_emits_bare_symbol(harness):
     com = job["infiles"]["gaussian.com"]
     atom_lines = [
         ln for ln in com.splitlines()
-        if ln.lstrip().startswith("H ") or "_other" in ln
+        if ln.lstrip().startswith("H(Iso=") or "_other" in ln
     ]
-    assert any(ln.lstrip().startswith("H ") for ln in atom_lines)
+    assert any(ln.lstrip().startswith("H(Iso=") for ln in atom_lines)
     assert not any("_other" in ln for ln in atom_lines)
 
 
@@ -1646,7 +1654,7 @@ def test_atom_labels_four_labeled_h_emit_bare_symbols(harness):
     with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
         job = harness.build_input(inp, _default_taskconfig())
     com = job["infiles"]["gaussian.com"]
-    h_lines = [ln for ln in com.splitlines() if ln.lstrip().startswith("H ")]
+    h_lines = [ln for ln in com.splitlines() if ln.lstrip().startswith("H(Iso=")]
     assert len(h_lines) == 4
     for forbidden in ("H5", "H_other", "H_4sq"):
         assert forbidden not in com
@@ -2763,3 +2771,52 @@ def test_gaussian_normal_modes_in_result_frame(fixed_frame):
     np.testing.assert_allclose(gau["omega_in_wavenumbers"], np.asarray(ref["omega_in_wavenumbers"])[vib], atol=2.0e-3)
     overlaps = np.abs(np.einsum("ij,ij->j", np.asarray(gau["x"]), np.asarray(ref["x"])[:, vib]))
     np.testing.assert_allclose(overlaps, 1.0, atol=1.0e-6)
+
+
+
+def test_build_input_states_every_mass(harness):
+    """Every atom carries the molecule's mass: Gaussian's defaults differ from QCElemental's for some elements."""
+    mol = Molecule.from_data("O 0 0 0.1173\nH@2.014101778 0 0.7572 -0.4692\nH 0 -0.7572 -0.4692\n@H@2.014101778 0 0 3.0")
+    inp = AtomicInput(molecule=mol, specification=_spec())
+    with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
+        com = harness.build_input(inp, _default_taskconfig())["infiles"]["gaussian.com"]
+    atom_lines = [ln.split()[0] for ln in com.splitlines() if ln[:1] in ("O", "H")]
+    assert atom_lines == ["O(Iso=15.9949146196)", "H(Iso=2.0141017780)", "H(Iso=1.0078250322)", "H-Bq(Iso=2.0141017780)"]
+
+
+@using("gaussian")
+def test_gaussian_uses_ghost_atom_mass():
+    import qcengine as qcng
+
+    mol = Molecule.from_data("O 0 0 0.1173\nH 0 0.7572 -0.4692\nH 0 -0.7572 -0.4692\n@H@2.014101778 0 0 3.0")
+    inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program="gaussian", driver="hessian", model={"method": "hf", "basis": "sto-3g"}, protocols={"native_files": "all"}))
+    log = qcng.compute(inp, "gaussian", raise_error=True).native_files["gaussian.log"]
+    assert re.search(r"AtmWgt=\s+15\.9949146\s+1\.0078250\s+1\.0078250\s+2\.0141018", log)
+
+
+def test_parse_archive_too_few_fields_raises():
+    log = " 1\\1\\GINC-HOST\\SP\\RHF\\\\Version=ES64L-G16RevC.01\\HF=-1.0\\\\@\n"
+    with pytest.raises(ValueError, match="Malformed archive"):
+        harvest_energies(log)
+
+
+@using("gaussian")
+@using("psi4")
+def test_gaussian_isotope_vibrations_match_psi4():
+    """Isotopic masses reach Gaussian, and the returned molecule keeps them."""
+    import qcengine as qcng
+
+    mol = Molecule.from_data(_WATER_HF_631GS_EQ.replace("H ", "H@2.014101778 "))
+
+    def run(program, keywords):
+        inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program=program, driver="hessian", model={"method": "hf", "basis": "6-31g*"}, keywords=keywords))
+        return qcng.compute(inp, program, raise_error=True)
+
+    gau = run("gaussian", {})
+    psi = run("psi4", {"scf_type": "pk", "d_convergence": 10}).extras["qcvars"]["VIBRATIONS"]
+    vib = [i for i, t in enumerate(psi["trv"]) if t == "v"]
+    np.testing.assert_allclose(gau.molecule.masses, mol.masses)
+    gv = gau.extras["qcvars"]["VIBRATIONS"]
+    np.testing.assert_allclose(gv["omega_in_wavenumbers"], np.asarray(psi["omega_in_wavenumbers"])[vib], atol=2.0e-3)
+    np.testing.assert_allclose(gv["mu"], np.asarray(psi["mu"])[vib], atol=2.0e-4)
+    np.testing.assert_allclose(np.abs(gv["q"]), np.abs(np.asarray(psi["q"])[:, vib]), atol=5.0e-5)
