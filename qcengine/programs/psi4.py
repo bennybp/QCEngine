@@ -16,7 +16,7 @@ from qcelemental.util import deserialize, parse_version, safe_version, which, wh
 from ..exceptions import InputError, RandomError, ResourceError, UnknownError
 from ..util import environ_context, execute, popen, temporary_directory
 from .model import ProgramHarness
-from .util.vibrations import build_vibrations
+from .util.vibrations import harmonic_analysis, projection_flags
 
 if TYPE_CHECKING:
     from qcelemental.models.v2 import AtomicInput
@@ -347,8 +347,8 @@ class Psi4Harness(ProgramHarness):
         else:
             output_model_v2 = qcelemental.models.v2.AtomicResult(**output_data_v1or2)
 
-        # QCSchema has no frequency driver, so psi4 stops at the Hessian; run
-        # psi4's own harmonic analysis on it, as psi4.frequency() would.
+        # QCSchema has no frequency driver, so psi4 stops at the Hessian; run the
+        # common harmonic analysis on it.
         if input_model.specification.driver == "hessian" and output_model_v2.success:
             try:
                 vib = _psi4_vibrations(output_model_v2)
@@ -367,78 +367,23 @@ class Psi4Harness(ProgramHarness):
 
 
 def _psi4_vibrations(result: "AtomicResult") -> Optional[Dict[str, Any]]:
-    """Psi4's harmonic analysis of a Hessian result, with psi4.frequency()'s projection rules.
+    """Harmonic analysis of a psi4 Hessian result in the common Vibrations layout.
 
-    Returns all 3*natom modes in the Vibrations layout (programs/util/vibrations.py),
-    classified by ``trv``.
-
-    Returns None if the psi4 module cannot be imported in this process or the
-    molecule has ghost atoms (no mass-weighting is defined for them).
+    Uses the shared harmonic_analysis with psi4.frequency()'s projection rules.
+    Returns None for molecules with ghost atoms.
     """
-    if not which_import("psi4", return_bool=True) or not all(result.molecule.real):
-        return None
-
-    import numpy as np
-    import psi4
-    from psi4.driver.qcdb.vib import harmonic_analysis
-
     mol = result.molecule
-    natom = len(mol.symbols)
-    geom = np.asarray(mol.geometry).reshape(natom, 3)
-
-    # psi4 molecule in the result's frame; only used for symmetry labels and SALCs
-    moldict = mol.model_dump()
-    moldict["fix_com"] = moldict["fix_orientation"] = True
-    pmol = psi4.core.Molecule.from_schema(moldict, nonphysical=True)
-    pmol.update_geometry()
-    if not np.allclose(np.asarray(pmol.geometry()), geom, atol=1.0e-6):
-        raise ValueError("psi4 molecule frame differs from the Hessian frame.")
-    basisset = None
-    for dummy_basis in ("STO-3G", "def2-universal-jkfit"):
-        try:
-            basisset = psi4.core.BasisSet.build(pmol, "ORBITAL", dummy_basis, quiet=True)
-            break
-        except Exception:
-            continue
-    if basisset is None:
-        raise ValueError("Could not build a dummy basis set for the symmetry analysis.")
-
-    # psi4.driver.driver._energy_is_invariant, without psi4's global state
+    if not all(mol.real):
+        return None
     qcvars = result.extras.get("qcvars", {})
     keywords = {k.lower(): v for k, v in result.input_data.specification.keywords.items()}
-    project_trans = not (keywords.get("extern") or keywords.get("perturb_h"))
-    gradient = qcvars.get("CURRENT GRADIENT")
-    gradient_rms = float(np.sqrt(np.mean(np.square(gradient)))) if gradient is not None else 1.0
-    project_rot = project_trans and gradient_rms < 1.0e-2
-
-    dipder = qcvars.get("CURRENT DIPOLE GRADIENT")
-    if dipder is not None:
-        dipder = np.asarray(dipder).reshape(3 * natom, 3).T
-
-    vibinfo, _ = harmonic_analysis(
-        np.asarray(result.return_result).reshape(3 * natom, 3 * natom),
-        geom,
-        np.asarray(mol.masses),
-        basisset,
-        pmol.irrep_labels(),
-        dipder=dipder,
-        project_trans=project_trans,
-        project_rot=project_rot,
+    flags = projection_flags(
+        qcvars.get("CURRENT GRADIENT"), external_potential=bool(keywords.get("extern") or keywords.get("perturb_h"))
     )
-
-    return build_vibrations(
-        [w.real if w.imag == 0.0 else -w.imag for w in vibinfo["omega"].data],
-        vibinfo["x"].data,
-        q=vibinfo["q"].data,
-        w=vibinfo["w"].data,
-        degeneracy=vibinfo["degeneracy"].data,
-        trv=vibinfo["TRV"].data,
-        gamma=vibinfo["gamma"].data,
-        mu=vibinfo["mu"].data,
-        k=vibinfo["k"].data,
-        dq0=vibinfo["DQ0"].data,
-        qtp0=vibinfo["Qtp0"].data,
-        xtp0=vibinfo["Xtp0"].data,
-        theta_vib=vibinfo["theta_vib"].data,
-        infrared_intensity=vibinfo["IR_intensity"].data if "IR_intensity" in vibinfo else None,
+    return harmonic_analysis(
+        result.return_result,
+        mol.geometry,
+        mol.masses,
+        dipole_derivatives=qcvars.get("CURRENT DIPOLE GRADIENT"),
+        **flags,
     )

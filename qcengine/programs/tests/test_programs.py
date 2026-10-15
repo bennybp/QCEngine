@@ -220,7 +220,7 @@ def test_psi4_vibrations():
     assert np.shape(vib["x"]) == (9, 9)
     assert compare_values([1826.554, 4070.460, 4188.705], vib["omega_in_wavenumbers"][6:], atol=1.0e-2)
     assert compare_values([107.27, 18.21, 58.11], vib["infrared_intensity"][6:], atol=1.0e-2)
-    for key in ("q", "w", "degeneracy", "gamma", "mu", "k", "dq0", "qtp0", "xtp0", "theta_vib"):
+    for key in ("q", "w", "degeneracy", "mu", "k", "dq0", "qtp0", "xtp0", "theta_vib"):
         assert key in vib
 
 

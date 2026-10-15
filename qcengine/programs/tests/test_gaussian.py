@@ -239,7 +239,7 @@ def test_muster_modelchem_gradient_job_type():
 # rq-82942b90
 def test_muster_modelchem_hessian_job_type():
     result = muster_modelchem("hf", "hessian", 1)
-    assert result["job_type"] == "Freq=HPModes"
+    assert result["job_type"] == "Freq"
     assert result["extra_keywords"] == {"Punch": "Derivatives"}
 
 
@@ -2545,7 +2545,7 @@ def test_build_input_hessian_requests_punch(harness, water):
     inp = AtomicInput(molecule=water, specification=_spec(driver="hessian"))
     with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
         com = harness.build_input(inp, _default_taskconfig())["infiles"]["gaussian.com"]
-    assert [ln for ln in com.splitlines() if ln.startswith("#P")] == ["#P HF/STO-3G Freq=HPModes Punch=Derivatives"]
+    assert [ln for ln in com.splitlines() if ln.startswith("#P")] == ["#P HF/STO-3G Freq Punch=Derivatives"]
 
 
 # ---------------------------------------------------------------------------
@@ -2663,37 +2663,21 @@ units angstrom
 
 
 @requires_cclib
-def test_harvest_vibrations_from_cclib():
+def test_harvest_dipole_derivatives_from_archive():
     in_mol = _make_water_mol()
-    disps = np.zeros((3, 3, 3))
-    disps[0, 0, 2], disps[1, 1, 1], disps[2, 2, 0] = 2.0, 1.0, -3.0
-    ccdata = _make_ccdata_with_attrs(
-        vibfreqs=np.array([-150.0, 1600.0, 3800.0]),
-        vibdisps=disps,
-        vibrmasses=np.array([1.1, 1.08, 1.04]),
-        vibfconsts=np.array([0.1, 2.3, 8.9]),
-        vibirs=np.array([5.0, 80.0, 20.0]),
-        vibsyms=["B1", "A1", "A1"],
-        atommasses=np.array([15.99491, 1.00783, 1.00783]),
-    )
-    with _patch_cclib(ccdata):
-        _, _, _, _, vib = harvest(in_mol, "hf", _g16_log())
-    assert vib["omega_in_wavenumbers"] == [-150.0, 1600.0, 3800.0]
-    assert vib["trv"] == ["v", "v", "v"]
-    assert vib["gamma"] == ["B1", "A1", "A1"]
-    assert vib["mu"] == [1.1, 1.08, 1.04]
-    x = np.asarray(vib["x"])
-    assert x.shape == (9, 3)  # one column per mode
-    np.testing.assert_allclose(np.linalg.norm(x, axis=0), 1.0)
-    np.testing.assert_allclose(x[:, 1], [0, 0, 0, 0, 1, 0, 0, 0, 0])
-    np.testing.assert_allclose(np.linalg.norm(vib["q"], axis=0), 1.0)
+    values = np.arange(27, dtype=float) * 0.01
+    archive = "\\DipoleDeriv=" + ",".join(f"{v:.7f}" for v in values)
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        *_, dipder = harvest(in_mol, "hf", _g16_log(archive=archive))
+    # row per Cartesian coordinate, column per dipole component (as Psi4's CURRENT DIPOLE GRADIENT)
+    np.testing.assert_allclose(dipder, values.reshape(9, 3))
 
 
 @requires_cclib
-def test_harvest_no_vibrations_without_freq():
+def test_harvest_no_dipole_derivatives_without_freq():
     with _patch_cclib(_make_ccdata_with_attrs()):
-        *_, vib = harvest(_make_water_mol(), "hf", _g16_log())
-    assert vib is None
+        *_, dipder = harvest(_make_water_mol(), "hf", _g16_log())
+    assert dipder is None
 
 
 def test_build_vibrations_layout_and_derived_modes():
@@ -2730,7 +2714,7 @@ def test_build_vibrations_validates_shapes():
 @using("gaussian")
 @using("psi4")
 def test_gaussian_vibrations_match_psi4():
-    """At a stationary point both programs project translations/rotations; vibrations agree."""
+    """Both harnesses run the common analysis on their Hessians; results agree mode by mode."""
     import qcengine as qcng
 
     mol = Molecule.from_data(_WATER_HF_631GS_EQ)
@@ -2741,37 +2725,32 @@ def test_gaussian_vibrations_match_psi4():
 
     gau = run("gaussian", {})
     psi = run("psi4", {"scf_type": "pk", "d_convergence": 10})
-    vib = [i for i, t in enumerate(psi["trv"]) if t == "v"]
-    assert gau["trv"] == ["v"] * 3
-    np.testing.assert_allclose(gau["omega_in_wavenumbers"], np.asarray(psi["omega_in_wavenumbers"])[vib], atol=2.0e-3)
-    np.testing.assert_allclose(gau["omega"], np.asarray(psi["omega"])[vib], atol=1.0e-8)
-    for key, atol in (("mu", 2.0e-4), ("k", 2.0e-4), ("infrared_intensity", 1.0e-3)):
-        np.testing.assert_allclose(gau[key], np.asarray(psi[key])[vib], atol=atol)
-    # Gaussian prints modes to 5 decimals; signs are arbitrary
+    assert gau["trv"] == psi["trv"] == ["tr"] * 6 + ["v"] * 3
+    vib = slice(6, 9)
+    np.testing.assert_allclose(gau["omega_in_wavenumbers"][vib], psi["omega_in_wavenumbers"][vib], atol=1.0e-3)
+    for key, atol in (("mu", 1.0e-7), ("k", 1.0e-6), ("infrared_intensity", 1.0e-3)):
+        np.testing.assert_allclose(gau[key][vib], psi[key][vib], atol=atol)
     for key in ("x", "q", "w"):
-        np.testing.assert_allclose(np.abs(gau[key]), np.abs(np.asarray(psi[key])[:, vib]), atol=5.0e-5)
+        np.testing.assert_allclose(np.asarray(gau[key])[:, vib], np.asarray(psi[key])[:, vib], atol=1.0e-6)
 
 
 @using("gaussian")
-@using("psi4")
-@pytest.mark.parametrize("fixed_frame", [True, False])
-def test_gaussian_normal_modes_in_result_frame(fixed_frame):
-    """Gaussian prints modes in its standard orientation; they must follow result.molecule."""
+def test_gaussian_vibrations_frame_invariant():
+    """Fixed and free frames give the same frequencies, reduced masses and IR intensities
+    (the free frame rotates the Hessian and dipole derivatives into the returned frame)."""
     import qcengine as qcng
-    from qcengine.programs.psi4 import _psi4_vibrations
 
     molstr = "O 0.31 -0.42 0.27\nH 1.12 -0.05 0.71\nH -0.29 0.19 0.68\nunits angstrom"
-    mol = Molecule.from_data(molstr + ("\nno_com\nno_reorient" if fixed_frame else ""))
-    inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program="gaussian", driver="hessian", model={"method": "hf", "basis": "6-31g*"}))
-    result = qcng.compute(inp, "gaussian", raise_error=True)
-    # independent analysis of Gaussian's own Hessian in the result frame, with rotations projected like Gaussian
-    ref = _psi4_vibrations(result.model_copy(update={"extras": {"qcvars": {"CURRENT GRADIENT": np.zeros((3, 3))}}}))
-    vib = [i for i, t in enumerate(ref["trv"]) if t == "v"]
-    gau = result.extras["qcvars"]["VIBRATIONS"]
-    np.testing.assert_allclose(gau["omega_in_wavenumbers"], np.asarray(ref["omega_in_wavenumbers"])[vib], atol=2.0e-3)
-    overlaps = np.abs(np.einsum("ij,ij->j", np.asarray(gau["x"]), np.asarray(ref["x"])[:, vib]))
-    np.testing.assert_allclose(overlaps, 1.0, atol=1.0e-6)
 
+    def run(extra):
+        inp = AtomicInput(molecule=Molecule.from_data(molstr + extra), specification=AtomicSpecification(program="gaussian", driver="hessian", model={"method": "hf", "basis": "6-31g*"}))
+        return qcng.compute(inp, "gaussian", raise_error=True).extras["qcvars"]["VIBRATIONS"]
+
+    fixed, free = run("\nno_com\nno_reorient"), run("")
+    assert fixed["trv"] == free["trv"]
+    vib = [i for i, t in enumerate(fixed["trv"]) if t == "v"]
+    for key, atol in (("omega_in_wavenumbers", 1.0e-4), ("mu", 1.0e-8), ("infrared_intensity", 1.0e-4)):
+        np.testing.assert_allclose(np.asarray(free[key])[vib], np.asarray(fixed[key])[vib], atol=atol)
 
 
 def test_build_input_states_every_mass(harness):
@@ -2817,6 +2796,72 @@ def test_gaussian_isotope_vibrations_match_psi4():
     vib = [i for i, t in enumerate(psi["trv"]) if t == "v"]
     np.testing.assert_allclose(gau.molecule.masses, mol.masses)
     gv = gau.extras["qcvars"]["VIBRATIONS"]
-    np.testing.assert_allclose(gv["omega_in_wavenumbers"], np.asarray(psi["omega_in_wavenumbers"])[vib], atol=2.0e-3)
-    np.testing.assert_allclose(gv["mu"], np.asarray(psi["mu"])[vib], atol=2.0e-4)
-    np.testing.assert_allclose(np.abs(gv["q"]), np.abs(np.asarray(psi["q"])[:, vib]), atol=5.0e-5)
+    assert gv["trv"] == psi["trv"]
+    np.testing.assert_allclose(np.asarray(gv["omega_in_wavenumbers"])[vib], np.asarray(psi["omega_in_wavenumbers"])[vib], atol=1.0e-3)
+    np.testing.assert_allclose(np.asarray(gv["mu"])[vib], np.asarray(psi["mu"])[vib], atol=1.0e-7)
+    np.testing.assert_allclose(np.asarray(gv["q"])[:, vib], np.asarray(psi["q"])[:, vib], atol=1.0e-6)
+
+
+
+def test_harmonic_analysis_rigid_motions():
+    from qcengine.programs.util.vibrations import _rigid_motion_space, harmonic_analysis
+
+    def stiff_hessian(geom, masses):
+        """Unit mass-weighted stiffness in every internal direction, zero for rigid motions."""
+        rigid = _rigid_motion_space(geom, np.asarray(masses), True, True)
+        sqrtm = np.repeat(np.sqrt(masses), 3)
+        return np.outer(sqrtm, sqrtm) * (np.identity(3 * len(masses)) - rigid.T @ rigid)
+
+    bent = np.array([[0.0, 0.0, 0.2], [0.0, 1.4, -0.9], [0.0, -1.4, -0.9]])
+    linear = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 2.2], [0.0, 0.0, -2.2]])
+    masses = [16.0, 1.0, 1.0]
+    assert harmonic_analysis(stiff_hessian(bent, masses), bent, masses)["trv"] == ["tr"] * 6 + ["v"] * 3
+    assert harmonic_analysis(stiff_hessian(linear, masses), linear, masses)["trv"] == ["tr"] * 5 + ["v"] * 4
+    assert harmonic_analysis(np.zeros((3, 3)), np.zeros((1, 3)), [4.0])["trv"] == ["tr"] * 3
+    # without projecting rotations (away from a stationary point they are not zero modes)
+    rigid = _rigid_motion_space(bent, np.asarray(masses), True, True)
+    trans = _rigid_motion_space(bent, np.asarray(masses), True, False)
+    sqrtm = np.repeat(np.sqrt(masses), 3)
+    rot_soft = stiff_hessian(bent, masses) + 0.01 * np.outer(sqrtm, sqrtm) * (rigid.T @ rigid - trans.T @ trans)
+    assert harmonic_analysis(rot_soft, bent, masses, project_rot=False)["trv"] == ["tr"] * 3 + ["v"] * 6
+
+
+def test_projection_flags():
+    from qcengine.programs.util.vibrations import projection_flags
+
+    assert projection_flags(np.zeros(9)) == {"project_trans": True, "project_rot": True}
+    assert projection_flags(np.full(9, 0.05)) == {"project_trans": True, "project_rot": False}
+    assert projection_flags(None) == {"project_trans": True, "project_rot": False}
+    assert projection_flags(np.zeros(9), external_potential=True) == {"project_trans": False, "project_rot": False}
+
+
+@using("psi4")
+@pytest.mark.parametrize("project_rot", [True, False])
+def test_harmonic_analysis_matches_psi4_implementation(project_rot):
+    """The common analysis reproduces psi4's qcdb.vib.harmonic_analysis (except irrep labels)."""
+    import psi4
+    import qcengine as qcng
+    from psi4.driver.qcdb.vib import harmonic_analysis as psi4_harmonic_analysis
+
+    from qcengine.programs.util.vibrations import harmonic_analysis
+
+    mol = Molecule.from_data("N 0 0 0.12\nH 0 0.94 -0.27\nH 0.81 -0.47 -0.27\nH -0.81 -0.47 -0.27\nunits angstrom\nno_com\nno_reorient")
+    inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program="psi4", driver="hessian", model={"method": "hf", "basis": "sto-3g"}, keywords={"scf_type": "pk"}))
+    res = qcng.compute(inp, "psi4", raise_error=True)
+    hess, geom, masses = np.asarray(res.return_result), res.molecule.geometry.reshape(-1, 3), res.molecule.masses
+    dipder = np.asarray(res.extras["qcvars"]["CURRENT DIPOLE GRADIENT"])
+
+    pmol = psi4.core.Molecule.from_schema({**res.molecule.model_dump(), "fix_com": True, "fix_orientation": True}, nonphysical=True)
+    pmol.update_geometry()
+    basis = psi4.core.BasisSet.build(pmol, "ORBITAL", "STO-3G", quiet=True)
+    ref, _ = psi4_harmonic_analysis(hess, geom, masses, basis, pmol.irrep_labels(), dipder=dipder.T, project_trans=True, project_rot=project_rot)
+    ours = harmonic_analysis(hess, geom, masses, dipole_derivatives=dipder, project_trans=True, project_rot=project_rot)
+
+    assert ours["trv"] == [t.lower() for t in ref["TRV"].data]
+    vib = [i for i, t in enumerate(ours["trv"]) if t == "v"]
+    omega = ref["omega"].data[vib]
+    np.testing.assert_allclose(np.asarray(ours["omega_in_wavenumbers"])[vib], np.where(omega.imag > omega.real, -omega.imag, omega.real), atol=1.0e-8)
+    for ours_key, ref_key in (("x", "x"), ("q", "q"), ("w", "w")):
+        np.testing.assert_allclose(np.asarray(ours[ours_key])[:, vib], np.asarray(ref[ref_key].data)[:, vib], atol=1.0e-10)
+    for ours_key, ref_key in (("mu", "mu"), ("k", "k"), ("dq0", "DQ0"), ("qtp0", "Qtp0"), ("xtp0", "Xtp0"), ("theta_vib", "theta_vib"), ("infrared_intensity", "IR_intensity"), ("degeneracy", "degeneracy")):
+        np.testing.assert_allclose(np.asarray(ours[ours_key])[vib], np.asarray(ref[ref_key].data)[vib], rtol=1.0e-9, atol=1.0e-10)

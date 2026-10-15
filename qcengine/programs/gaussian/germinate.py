@@ -26,8 +26,7 @@ _METHOD_MAP = {
 _DRIVER_JOB_TYPE = {
     "energy": "",
     "gradient": "Force=NoStep",
-    # HPModes prints normal modes to 5 decimals instead of 2
-    "hessian": "Freq=HPModes",
+    "hessian": "Freq",
     "properties": "",
 }
 

@@ -3,14 +3,13 @@
 import io
 import re
 from decimal import Decimal
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import qcelemental as qcel
 from qcelemental.models import Molecule
 
 from ..util import PreservingDict
-from ..util.vibrations import build_vibrations
 
 # rq-0743e952
 _NORMAL_TERMINATION_RE = re.compile(r"Normal termination of Gaussian")
@@ -303,7 +302,7 @@ def harvest(
     method: str,
     log_content: str,
     punch_content: Optional[str] = None,
-) -> Tuple[PreservingDict, Optional[np.ndarray], Optional[np.ndarray], Molecule, Optional[Dict[str, Any]]]:
+) -> Tuple[PreservingDict, Optional[np.ndarray], Optional[np.ndarray], Molecule, Optional[np.ndarray]]:
     """Parse a Gaussian log file and return QC data for building an AtomicResult.
 
     Parameters
@@ -319,12 +318,12 @@ def harvest(
 
     Returns
     -------
-    (qcvars, grad, hess, out_mol, vib)
+    (qcvars, grad, hess, out_mol, dipder)
         qcvars:  PreservingDict of QC variables (energies, charges, etc.).
         grad:    Gradient array shape (3*natoms,) in Hartree/Bohr, or None.
         hess:    Hessian matrix shape (3*natoms, 3*natoms) in Hartree/Bohr², or None.
         out_mol: Output molecule aligned to in_mol.
-        vib:     Gaussian's harmonic analysis as a Vibrations dict (programs/util/vibrations.py), or None.
+        dipder:  Dipole derivatives (3*natoms, 3) [e a0/a0] in the frame of out_mol (row per coordinate), or None.
 
     Raises
     ------
@@ -471,27 +470,6 @@ def harvest(
                 input_to_calc_mill = data["mill"]
                 hess = input_to_calc_mill.align_hessian(parsed_hess)
 
-    # --- Harmonic analysis (Freq jobs) ---
-    # Gaussian's own analysis; modes are printed in the same (standard) frame as
-    # cclib's atomcoords, so they rotate into the returned frame like the gradient.
-    vib: Optional[Dict[str, Any]] = None
-    # Gaussian prints vibrations only (no translations/rotations).
-    if getattr(ccdata, "vibfreqs", None) is not None and getattr(ccdata, "vibdisps", None) is not None:
-        modes = [mill.align_gradient(np.asarray(d)).ravel() for d in ccdata.vibdisps]
-        x = np.array([m / np.linalg.norm(m) for m in modes]).T
-        # Gaussian's own masses, used to derive the mass-weighted modes
-        masses = getattr(ccdata, "atommasses", None)
-        vib = build_vibrations(
-            ccdata.vibfreqs,
-            x,
-            masses=masses if masses is not None else in_mol.masses,
-            trv=["v"] * len(ccdata.vibfreqs),
-            gamma=getattr(ccdata, "vibsyms", None),
-            mu=getattr(ccdata, "vibrmasses", None),
-            k=getattr(ccdata, "vibfconsts", None),
-            infrared_intensity=getattr(ccdata, "vibirs", None),
-        )
-
     # --- Properties: dipole and Mulliken charges ---
     # rq-c7fd08b5 rq-943856cc rq-53f8ed12 rq-4c4a1542 rq-ffae3fa6
     # The archive dipole is in a.u. and the input orientation. For post-SCF
@@ -507,12 +485,23 @@ def harvest(
         qcvars["SCF DIPOLE"] = dipole
         qcvars["CURRENT DIPOLE"] = dipole
 
+    # Dipole derivatives (frequency jobs), archive layout: row per Cartesian coordinate,
+    # column per dipole component, input orientation
+    dipder: Optional[np.ndarray] = None
+    if "DipoleDeriv" in archive_items:
+        dipder = np.array([float(v) for v in archive_items["DipoleDeriv"].split(",")]).reshape(3 * natoms, 3)
+        if not (in_mol.fix_com and in_mol.fix_orientation):
+            _, data = in_mol.align(calc_mol, **align_kwargs)
+            to_calc = data["mill"]
+            dipder = np.array([to_calc.align_gradient(col.reshape(natoms, 3)).ravel() for col in dipder.T]).T
+            dipder = np.array([to_calc.align_vector(row) for row in dipder])
+
     if hasattr(ccdata, "atomcharges") and ccdata.atomcharges:
         mulliken = ccdata.atomcharges.get("mulliken")
         if mulliken is not None:
             qcvars["MULLIKEN CHARGES"] = list(mulliken)
 
-    return qcvars, grad, hess, return_mol, vib
+    return qcvars, grad, hess, return_mol, dipder
 
 
 def is_normal_termination(log_content: str) -> bool:

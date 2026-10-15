@@ -15,6 +15,7 @@ from ...util import execute
 from ..model import ProgramHarness
 from ..qcvar_identities_resources import build_atomicproperties, build_out
 from ..util import error_stamp
+from ..util.vibrations import harmonic_analysis, projection_flags
 from .basis import build_bse_basis, is_bse_basis
 from .germinate import muster_modelchem
 from .harvester import UnsupportedMethodError, harvest, is_normal_termination
@@ -336,7 +337,7 @@ class GaussianHarness(ProgramHarness):
             method = method[len("gaussian-"):]
 
         try:
-            qcvars, grad, hess, out_mol, vib = harvest(input_model.molecule, method, log_text, punch_text)
+            qcvars, grad, hess, out_mol, dipder = harvest(input_model.molecule, method, log_text, punch_text)
         except UnsupportedMethodError as e:
             raise InputError(f"{e}\n\n{error_stamp(input_text, log_text, stderr)}") from e
         except Exception as e:
@@ -354,6 +355,18 @@ class GaussianHarness(ProgramHarness):
         if hess is not None:
             qcvars[f"{method_upper} TOTAL HESSIAN"] = hess
             qcvars["CURRENT HESSIAN"] = hess
+
+        # Common harmonic analysis of the Hessian (programs/util/vibrations.py)
+        vib = None
+        if hess is not None and all(out_mol.real):
+            keywords = {k.lower() for k in input_model.specification.keywords}
+            vib = harmonic_analysis(
+                hess,
+                out_mol.geometry,
+                out_mol.masses,
+                dipole_derivatives=dipder,
+                **projection_flags(grad, external_potential=bool(keywords & {"field", "charge"})),
+            )
 
         driver = input_model.specification.driver.value  # DriverEnum → plain lowercase string
         try:
