@@ -64,6 +64,9 @@ _ERROR_PATTERNS = (
     ),
 )
 
+# Largest |coordinate| [Angstrom] that Gaussian's F12.6 tables can print for either sign
+_MAX_COORDINATE = 9999.0
+
 # AtomicSpecification.extras key used by the GaussianDriver procedure to request
 # an Opt job (value: dict of Gaussian Opt options) instead of the driver's job type
 OPT_EXTRAS_KEY = "gaussian:opt"
@@ -235,6 +238,23 @@ class GaussianHarness(ProgramHarness):
         # without a nucleus or electrons.
         bohr_to_ang = qcel.constants.conversion_factor("bohr", "angstrom")
         geom_ang = mol.geometry.reshape(-1, 3) * bohr_to_ang
+        # Gaussian prints coordinates as F12.6, which overflows (asterisks) at
+        # -10000 Angstrom; its output then cannot be parsed. Input orientation: the
+        # coordinates themselves. Standard orientation (any rotation, origin inside
+        # the molecule): bounded by the largest interatomic distance.
+        extent = np.abs(geom_ang).max()
+        if len(geom_ang) > 1:
+            diameter = np.linalg.norm(geom_ang[:, None, :] - geom_ang[None, :, :], axis=-1).max()
+            if diameter >= _MAX_COORDINATE:
+                raise InputError(
+                    f"Molecule spans {diameter:.1f} Angstrom; Gaussian cannot print coordinates beyond "
+                    f"{_MAX_COORDINATE:.0f} Angstrom."
+                )
+        if extent >= _MAX_COORDINATE:
+            raise InputError(
+                f"Molecule coordinates reach {extent:.1f} Angstrom; Gaussian cannot print coordinates "
+                f"beyond {_MAX_COORDINATE:.0f} Angstrom. Recenter the molecule."
+            )
         atom_lines = []
         for sym, is_real, mass, (x, y, z) in zip(mol.symbols, mol.real, mol.masses, geom_ang):
             # Always state the molecule's mass: Gaussian's default masses differ from

@@ -3113,3 +3113,19 @@ def test_gaussian_far_translated_molecule():
         return qcng.compute(inp, "gaussian", raise_error=True)
 
     np.testing.assert_allclose(run(mol).return_result, run(ref).return_result, atol=1.0e-6)
+
+
+def test_build_input_coordinate_overflow_raises(harness):
+    mol = Molecule.from_data("O -10000 -20000 -30000\nH -10000 -19999.2428 -30000.5865\nH -10000 -20000.7572 -30000.5865\nunits angstrom")
+    inp = AtomicInput(molecule=Molecule(**{**mol.model_dump(), "fix_com": True, "fix_orientation": True}), specification=_spec())
+    with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
+        with pytest.raises(InputError, match="Recenter"):
+            harness.build_input(inp, _default_taskconfig())
+
+
+def test_build_input_molecule_too_wide_raises(harness):
+    """Within bounds per coordinate, but Gaussian's standard orientation could put an atom beyond them."""
+    mol = Molecule.from_data("He 8000 8000 8000\nHe -8000 -8000 -8000\nunits angstrom\nno_com\nno_reorient")
+    with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
+        with pytest.raises(InputError, match="spans"):
+            harness.build_input(AtomicInput(molecule=mol, specification=_spec()), _default_taskconfig())
