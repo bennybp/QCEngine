@@ -53,7 +53,13 @@ def harvest_optimization(in_mol: Molecule, method: str, log_content: str) -> Lis
         raise ValueError("No completed optimization steps found in the Gaussian log.")
 
     ang2bohr = qcel.constants.conversion_factor("angstrom", "bohr")
-    base = in_mol.model_dump()
+    # New geometries: keep the input's identity and metadata, but not the fields
+    # that describe the input geometry itself
+    base = in_mol.model_dump(exclude={"id", "provenance"})
+    if base.get("identifiers"):
+        base["identifiers"] = {
+            k: v for k, v in base["identifiers"].items() if k not in ("molecule_hash", "pubchem_conformerid")
+        }
 
     # final geometry from the archive: "charge,mult\Sym,x,y,z\..." [Angstrom]
     _parse_archive(log_content)  # validates the archive entry

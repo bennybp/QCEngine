@@ -50,6 +50,18 @@ _CORRELATED_LEVELS = {
 _ARCHIVE_ATOL = 2.0e-6
 
 
+_ROTCONST_LINE_RE = re.compile(r"^ Rotational constants \(GHZ\):.*$", re.M)
+
+
+def _sanitize_for_cclib(log_content: str) -> str:
+    """Make overflowed fields that cclib cannot parse readable.
+
+    Gaussian prints rotational constants that overflow their format (nearly
+    linear molecules) as asterisks; the harness does not use them.
+    """
+    return _ROTCONST_LINE_RE.sub(lambda m: re.sub(r"\*{2,}", "inf", m.group(0)), log_content)
+
+
 class UnsupportedMethodError(Exception):
     """Gaussian ran a method whose energies the harvester cannot extract."""
 
@@ -346,7 +358,7 @@ def harvest(
     # rq-bb0a5d96 — parse with cclib; exceptions propagate to caller (rq-bb775969)
     import cclib
 
-    ccdata = cclib.io.ccopen(io.StringIO(log_content)).parse()
+    ccdata = cclib.io.ccopen(io.StringIO(_sanitize_for_cclib(log_content))).parse()
 
     qcvars = PreservingDict()
 

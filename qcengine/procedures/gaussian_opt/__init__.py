@@ -102,6 +102,7 @@ class GaussianDriverProcedure(ProcedureHarness):
             ],
             properties={
                 "return_energy": final.properties.return_energy,
+                "return_gradient": final.return_result,
                 "nuclear_repulsion_energy": final.molecule.nuclear_repulsion_energy(),
                 "optimization_iterations": len(trajectory),
             },

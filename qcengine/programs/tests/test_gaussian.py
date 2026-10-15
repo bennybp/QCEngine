@@ -2977,3 +2977,51 @@ def test_gaussiandriver_trajectory_protocol():
     res = qcng.compute(_opt_input(protocols={"trajectory_results": "final"}), "gaussiandriver", raise_error=True)
     assert len(res.trajectory_results) == 1
     assert res.properties.optimization_iterations > 1
+
+
+
+def test_sanitize_for_cclib_rotational_constants():
+    from qcengine.programs.gaussian.harvester import _sanitize_for_cclib
+
+    log = " Rotational constants (GHZ):      ************    11.74057    11.74057\n Other ****** line\n"
+    assert _sanitize_for_cclib(log) == " Rotational constants (GHZ):      inf    11.74057    11.74057\n Other ****** line\n"
+
+
+@using("gaussian")
+def test_gaussian_nearly_linear_hessian():
+    """Overflowed rotational constants (printed as asterisks) must not break parsing."""
+    import qcengine as qcng
+
+    mol = Molecule.from_data("C 0.001 0 0\nO 0 0 1.16\nO 0 0 -1.16\nunits angstrom")
+    inp = AtomicInput(molecule=mol, specification=AtomicSpecification(program="gaussian", driver="hessian", model={"method": "hf", "basis": "sto-3g"}))
+    result = qcng.compute(inp, "gaussian", raise_error=True)
+    assert len(result.extras["qcvars"]["VIBRATIONS"]["trv"]) == 9
+
+
+@using("gaussian")
+def test_gaussiandriver_molecule_identity():
+    """Optimized geometries keep geometry-independent metadata but not the input's id/hash."""
+    import qcengine as qcng
+    from qcelemental.models.v2 import OptimizationInput
+
+    initial = Molecule.from_data(_DISTORTED_WATER)
+    initial = Molecule(
+        **{
+            **initial.model_dump(),
+            "id": "initial-db-id",
+            "identifiers": {"molecule_hash": "initial-hash", "pubchem_conformerid": "initial-conformer", "smiles": "O"},
+            "provenance": {"creator": "initial-creator", "version": "0", "routine": "initial-routine"},
+        }
+    )
+    inp = OptimizationInput(
+        initial_molecule=initial,
+        specification={"protocols": {"trajectory_results": "all"}, "specification": {"driver": "gradient", "program": "gaussian", "model": {"method": "hf", "basis": "6-31G*"}}},
+    )
+    res = qcng.compute(inp, "gaussiandriver", raise_error=True)
+    for mol in [res.final_molecule] + [t.molecule for t in res.trajectory_results]:
+        assert mol.id is None
+        assert mol.identifiers.molecule_hash != "initial-hash"
+        assert mol.identifiers.pubchem_conformerid is None
+        assert mol.provenance.creator != "initial-creator"
+        assert mol.identifiers.smiles == "O"
+    np.testing.assert_allclose(res.properties.return_gradient, res.trajectory_results[-1].return_result)
