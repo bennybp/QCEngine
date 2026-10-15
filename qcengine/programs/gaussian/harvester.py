@@ -50,6 +50,38 @@ _CORRELATED_LEVELS = {
 _ARCHIVE_ATOL = 2.0e-6
 
 
+# Archive geometry vs. input geometry [Angstrom]; the archive has ~10 decimals,
+# and Gaussian's own symmetrization moves atoms by < 1e-8 Angstrom
+_GEOMETRY_ATOL = 1.0e-5
+
+_FORCES_RE = re.compile(r"Forces \(Hartrees/Bohr\)\s*\n.*?\n\s*-+\n(.*?)\n\s*-+", re.S)
+
+
+def _atom_table(block: str, natom: int) -> np.ndarray:
+    """Last three columns of a Gaussian per-atom table (geometry or forces), (natom, 3)."""
+    rows = [line.split()[-3:] for line in block.strip().splitlines()]
+    if len(rows) != natom:
+        raise ValueError(f"Expected {natom} atoms in a Gaussian table, found {len(rows)}.")
+    return np.array(rows, dtype=float)
+
+
+def archive_geometry(log_content: str) -> np.ndarray:
+    """Cartesian geometry [Angstrom] of the last archive entry, (natom, 3).
+
+    It is in the input orientation: the input geometry for single points, the
+    final geometry for optimizations.
+    """
+    start = log_content.rfind("1\\1\\GINC")
+    if start == -1:
+        raise ValueError("No archive entry found in the Gaussian log.")
+    sections = re.sub(r"\n ", "", log_content[start:]).split("\\\\")
+    if len(sections) < 4:
+        raise ValueError("Malformed archive entry in the Gaussian log.")
+    # "charge,mult\Label,x,y,z\..." (labels may carry ",0" freeze flags, -Bq, (Iso=...))
+    atoms = sections[3].split("\\")[1:]
+    return np.array([atom.split(",")[-3:] for atom in atoms], dtype=float)
+
+
 _ROTCONST_LINE_RE = re.compile(r"^ Rotational constants \(GHZ\):.*$", re.M)
 
 
@@ -331,7 +363,7 @@ def harvest(
     Parameters
     ----------
     in_mol:
-        The input molecule used for geometry alignment and NRE cross-check.
+        The input molecule; returned unchanged after checking it against Gaussian's geometry.
     method:
         Lowercase QCSchema method string (e.g. "hf", "mp2", "b3lyp").
     log_content:
@@ -345,15 +377,13 @@ def harvest(
         qcvars:  PreservingDict of QC variables (energies, charges, etc.).
         grad:    Gradient array shape (3*natoms,) in Hartree/Bohr, or None.
         hess:    Hessian matrix shape (3*natoms, 3*natoms) in Hartree/Bohr², or None.
-        out_mol: Output molecule aligned to in_mol.
-        dipder:  Dipole derivatives (3*natoms, 3) [e a0/a0] in the frame of out_mol (row per coordinate), or None.
+        out_mol: The input molecule (all quantities are in its frame).
+        dipder:  Dipole derivatives (3*natoms, 3) [e a0/a0] (row per coordinate), or None.
 
     Raises
     ------
     ValueError
-        If no coordinate information can be extracted from the log.
-    ValueError
-        If the parsed geometry's NRE deviates from in_mol's by more than 1e-3 Hartree.
+        If the log has no archive entry, or Gaussian's geometry differs from in_mol.
     """
     # rq-bb0a5d96 — parse with cclib; exceptions propagate to caller (rq-bb775969)
     import cclib
@@ -370,53 +400,32 @@ def harvest(
     functional_label = functional.upper() if dispersion_level is not None else None
 
     # --- Geometry and output molecule ---
-    # rq-8d6fc024 rq-a76c3d7b rq-b7c7b8cb
-    if not hasattr(ccdata, "atomcoords") or len(ccdata.atomcoords) == 0:
-        raise ValueError("No coordinate information could be extracted from the Gaussian log.")
+    # rq-8d6fc024 rq-a76c3d7b rq-b7c7b8cb rq-f1d712bb
+    # Everything returned below (forces, punch/log Hessian, archive dipole and
+    # dipole derivatives) is printed in Gaussian's input orientation, i.e. the
+    # input molecule's frame and atom order, with or without symmetry. So the
+    # input molecule is returned unchanged and nothing is rotated. (cclib's
+    # coordinates and gradients are in the standard orientation when symmetry is
+    # on and are not used.) The archive geometry (~10 decimals) must match it.
+    natoms = len(in_mol.symbols)
+    bohr_to_angstrom = qcel.constants.conversion_factor("bohr", "angstrom")
+    gaussian_geometry = archive_geometry(log_content)
+    if gaussian_geometry.shape != (natoms, 3):
+        raise ValueError(
+            f"Gaussian's atom count ({len(gaussian_geometry)}) does not match the input molecule's ({natoms})."
+        )
+    deviation = np.abs(gaussian_geometry - in_mol.geometry.reshape(-1, 3) * bohr_to_angstrom).max()
+    if deviation > _GEOMETRY_ATOL:
+        raise ValueError(
+            f"Gaussian's geometry differs from the input molecule by up to {deviation:.2e} Angstrom "
+            "(symmetrized or reoriented?)."
+        )
+    return_mol = in_mol
 
-    # atomcoords in Ångström → convert to Bohr for QCElemental
-    angstrom_to_bohr = qcel.constants.conversion_factor("angstrom", "bohr")
-    coords_bohr = ccdata.atomcoords[-1] * angstrom_to_bohr  # shape (natoms, 3)
-
-    # rq-f1d712bb rq-66067019 rq-7411efa0 — cclib cannot distinguish ghost atoms
-    # from real ones in Gaussian output (Gaussian marks ghosts via the "Atomic Type"
-    # column = 1000, which cclib does not expose). Trust in_mol.real as the sole
-    # source of ghost designation; sanity-check only that the parsed atom count
-    # matches in_mol when ghosts are present.
-    in_real = list(in_mol.real)
-    has_ghosts = not all(in_real)
-    if has_ghosts:
-        if ccdata.natom != len(in_mol.symbols):
-            raise ValueError(
-                f"Gaussian log atom count ({ccdata.natom}) does not match the "
-                f"input molecule's atom count ({len(in_mol.symbols)})."
-            )
-        symbols = list(in_mol.symbols)
-        real_flags = in_real
-    else:
-        symbols = [qcel.periodictable.to_symbol(z) for z in ccdata.atomnos]
-        real_flags = None
-
-    # rq-f1d712bb — preserve ghost designation on calc_mol so its NRE excludes ghosts
-    # Gaussian keeps the input atom order; carry over masses (isotopes are passed via Iso=)
-    calc_mol_kwargs = dict(
-        symbols=symbols,
-        geometry=coords_bohr.flatten(),
-        masses=in_mol.masses,
-        mass_numbers=in_mol.mass_numbers,
-        fix_com=True,
-        fix_orientation=True,
-    )
-    if real_flags is not None:
-        calc_mol_kwargs["real"] = real_flags
-    calc_mol = Molecule(**calc_mol_kwargs)
-
-    natoms = ccdata.natom
     qcvars["N ATOMS"] = str(natoms)
-
-    if hasattr(ccdata, "nbasis") and ccdata.nbasis is not None:
+    if getattr(ccdata, "nbasis", None) is not None:
         qcvars["N BASIS FUNCTIONS"] = str(ccdata.nbasis)
-    if hasattr(ccdata, "nmo") and ccdata.nmo is not None:
+    if getattr(ccdata, "nmo", None) is not None:
         qcvars["N MOLECULAR ORBITALS"] = str(ccdata.nmo)
     # cclib's homos has a single entry for ROHF, so read the counts from the log
     alpha_beta = _ALPHA_BETA_RE.search(log_content)
@@ -424,100 +433,46 @@ def harvest(
         qcvars["N ALPHA ELECTRONS"] = alpha_beta.group(1)
         qcvars["N BETA ELECTRONS"] = alpha_beta.group(2)
 
-    # rq-0753cd03
-    qcvars["NUCLEAR REPULSION ENERGY"] = str(round(calc_mol.nuclear_repulsion_energy(), 10))
-
-    # rq-90604835 rq-a69d0898 rq-e5a98119 — cross-check NRE against input molecule.
-    # Molecule.nuclear_repulsion_energy() excludes ghost atoms (zero Z), so when
-    # calc_mol.real mirrors in_mol.real both NREs sum over real atoms only.
-    if abs(calc_mol.nuclear_repulsion_energy() - in_mol.nuclear_repulsion_energy()) > 1.0e-3:
-        raise ValueError(
-            f"Gaussian output geometry (NRE: {calc_mol.nuclear_repulsion_energy():.6f}) "
-            f"is inconsistent with the input molecule (NRE: {in_mol.nuclear_repulsion_energy():.6f})."
-        )
-
-    # Frame considerations (same pattern as GAMESS harvester)
-    # rq-8d6fc024 rq-f8ce079b
-    align_kwargs = dict(atoms_map=False, mols_align=True, run_mirror=True, verbose=0)
-    if has_ghosts:
-        align_kwargs["generic_ghosts"] = True
-    if in_mol.fix_com and in_mol.fix_orientation:
-        # Impose input frame if important as signalled by fix_*=True
-        return_mol = in_mol
-        _, data = calc_mol.align(in_mol, **align_kwargs)
-        mill = data["mill"]
-    else:
-        return_mol, _ = in_mol.align(calc_mol, **align_kwargs)
-        mill = qcel.molutil.compute_scramble(
-            len(in_mol.symbols), do_resort=False, do_shift=False, do_rotate=False, do_mirror=False
-        )  # identity AlignmentMill
+    # rq-0753cd03 — ghost atoms (real=False) do not contribute
+    qcvars["NUCLEAR REPULSION ENERGY"] = str(round(in_mol.nuclear_repulsion_energy(), 10))
 
     # --- Energies ---
     # rq-37f40e92 rq-929a262a rq-c5165f1f rq-1d5da737
     qcvars.update(harvest_energies(log_content, functional_label, dispersion_level))
 
     # --- Gradient (forces → negate for gradient) ---
-    # rq-36736115 rq-3b0adf96
+    # rq-36736115 rq-3b0adf96 — the last forces block is the reference geometry,
+    # also for numerical Hessians (displaced geometries come first)
     grad: Optional[np.ndarray] = None
-    if hasattr(ccdata, "grads") and ccdata.grads is not None and len(ccdata.grads) > 0:
-        # ccdata.grads shape: (nsteps, natoms, 3) in Hartree/Bohr (forces = -dE/dR)
-        # Gradient = -forces; align_gradient expects (natom, 3)
-        calc_grad = -ccdata.grads[-1]  # shape (natoms, 3)
-        grad = mill.align_gradient(calc_grad).flatten()
+    forces_blocks = _FORCES_RE.findall(log_content)
+    if forces_blocks:
+        grad = -_atom_table(forces_blocks[-1], natoms).flatten()
 
     # --- Hessian ---
-    # rq-f2e32162 rq-344f3432
+    # rq-f2e32162 rq-344f3432 rq-f8ce079b — punch file (10 significant figures),
+    # else the log's "Force constants in Cartesian coordinates" (6)
     hess: Optional[np.ndarray] = None
-    punch_hess = _parse_punch(punch_content, natoms)[1] if punch_content else None
-    if hasattr(ccdata, "hessian") and ccdata.hessian is not None:
-        # cclib hessian would be in standard orientation → transform with mill
-        hess = mill.align_hessian(np.array(ccdata.hessian))
-    else:
-        # cclib's Gaussian parser does not populate ccdata.hessian (the full
-        # 3N×3N Cartesian Hessian matrix). It does populate ccdata.vibfconsts
-        # (per-normal-mode reduced force constants, shape (nmodes,)) from the
-        # "Frc consts --" lines, but that's not the matrix we need. Fall back
-        # to direct log parsing of "Force constants in Cartesian coordinates"
-        # (printed in the INPUT orientation).
-        parsed_hess = punch_hess if punch_hess is not None else _parse_force_constants(log_content, 3 * natoms)
-        if parsed_hess is not None:
-            if in_mol.fix_com and in_mol.fix_orientation:
-                # return_mol = in_mol (input frame), hessian already in input frame
-                hess = parsed_hess
-            else:
-                # return_mol is in calc/standard frame; need to transform
-                # hessian from input→standard. The mill from calc_mol.align(in_mol)
-                # transforms calc→input, so we need input→calc.
-                # rq-f8ce079b
-                _, data = in_mol.align(calc_mol, **align_kwargs)
-                input_to_calc_mill = data["mill"]
-                hess = input_to_calc_mill.align_hessian(parsed_hess)
+    if punch_content:
+        hess = _parse_punch(punch_content, natoms)[1]
+    if hess is None:
+        hess = _parse_force_constants(log_content, 3 * natoms)
 
     # --- Properties: dipole and Mulliken charges ---
     # rq-c7fd08b5 rq-943856cc rq-53f8ed12 rq-4c4a1542 rq-ffae3fa6
-    # The archive dipole is in a.u. and the input orientation. For post-SCF
-    # gradients it may come from a correlated density, so only SCF methods report it.
+    # The archive dipole is in a.u. For post-SCF gradients it may come from a
+    # correlated density, so only SCF methods report it.
     _, _, archive_items = _parse_archive(log_content)
     if "Dipole" in archive_items and "SCF TOTAL ENERGY" in qcvars and "MP2 TOTAL ENERGY" not in qcvars:
         dipole = np.array([float(x) for x in archive_items["Dipole"].split(",")])
-        if not (in_mol.fix_com and in_mol.fix_orientation):
-            _, data = in_mol.align(calc_mol, **align_kwargs)
-            dipole = data["mill"].align_vector(dipole)
         if "HF TOTAL ENERGY" in qcvars:
             qcvars["HF DIPOLE"] = dipole
         qcvars["SCF DIPOLE"] = dipole
         qcvars["CURRENT DIPOLE"] = dipole
 
-    # Dipole derivatives (frequency jobs), archive layout: row per Cartesian coordinate,
-    # column per dipole component, input orientation
+    # Dipole derivatives (frequency jobs): row per Cartesian coordinate, column per dipole component
     dipder: Optional[np.ndarray] = None
     if "DipoleDeriv" in archive_items:
         dipder = np.array([float(v) for v in archive_items["DipoleDeriv"].split(",")]).reshape(3 * natoms, 3)
-        if not (in_mol.fix_com and in_mol.fix_orientation):
-            _, data = in_mol.align(calc_mol, **align_kwargs)
-            to_calc = data["mill"]
-            dipder = np.array([to_calc.align_gradient(col.reshape(natoms, 3)).ravel() for col in dipder.T]).T
-            dipder = np.array([to_calc.align_vector(row) for row in dipder])
 
     if hasattr(ccdata, "atomcharges") and ccdata.atomcharges:
         mulliken = ccdata.atomcharges.get("mulliken")

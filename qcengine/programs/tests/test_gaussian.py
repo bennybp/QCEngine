@@ -152,19 +152,39 @@ def _patch_cclib(ccdata):
     return patch("cclib.io.ccopen", mock_ccopen)
 
 
-def _g16_log(scf="-76.0105049953", scf_label="RHF", method=None, body="", archive="", pre="", basis="STO-3G"):
-    """Minimal Gaussian log: SCF Done line, extra body lines, archive entry, normal termination.
+_WATER_ANGSTROM = [[0.0, 0.0, 0.117176320], [0.0, 0.757335953, -0.468705281], [0.0, -0.757335953, -0.468705281]]
+
+
+def _g16_log(scf="-76.0105049953", scf_label="RHF", method=None, body="", archive="", pre="", basis="STO-3G", mol=None, forces=None):
+    """Minimal Gaussian log: SCF Done line, extra body lines, forces, archive entry, normal termination.
 
     ``archive`` is appended to the archive's Version= section after ``HF=``,
     e.g. ``"\\MP2=-76.2284380"``; ``method`` is the archive method label
-    (defaults to ``scf_label``).
+    (defaults to ``scf_label``). The archive geometry is that of ``mol``
+    (default: the water fixture); ``forces`` (natom, 3) adds a forces block.
     """
     method = method or scf_label
+    if mol is None:
+        symbols, geom = ["O", "H", "H"], np.array(_WATER_ANGSTROM)
+    else:
+        symbols, geom = mol.symbols, mol.geometry.reshape(-1, 3) * qcel.constants.conversion_factor("bohr", "angstrom")
+    atoms = "\\".join(f"{sym},{x:.10f},{y:.10f},{z:.10f}" for sym, (x, y, z) in zip(symbols, geom))
+    forces_block = ""
+    if forces is not None:
+        rows = "\n".join(f"  {i + 1:5d}  {1:8d}  {fx:15.9f}{fy:15.9f}{fz:15.9f}" for i, (fx, fy, fz) in enumerate(forces))
+        forces_block = (
+            " Center     Atomic                   Forces (Hartrees/Bohr)\n"
+            " Number     Number              X              Y              Z\n"
+            " -------------------------------------------------------------------\n"
+            f"{rows}\n"
+            " -------------------------------------------------------------------\n"
+        )
     return (
         f"{pre}"
         f" SCF Done:  E({scf_label}) =  {scf}     A.U. after   10 cycles\n"
         f"{body}"
-        f" 1\\1\\GINC-HOST\\SP\\{method}\\{basis}\\H2O1\\USER\\13-Oct-2026\\0\\\\#P\\\\t\\\\0,1\\O,0,0.,0.,0.\\\\"
+        f"{forces_block}"
+        f" 1\\1\\GINC-HOST\\SP\\{method}\\{basis}\\H2O1\\USER\\13-Oct-2026\\0\\\\#P\\\\t\\\\0,1\\{atoms}\\\\"
         f"Version=ES64L-G16RevC.01\\HF={float(scf):.7f}{archive}\\RMSD=1.000e-09\\PG=C02V\\\\@\n"
         " Normal termination of Gaussian 16 at Tue Oct 13 12:00:00 2026.\n"
     )
@@ -703,7 +723,7 @@ def test_compute_returns_atomic_result_gradient(harness, water):
         grads=forces[np.newaxis, :, :],  # shape (1, 3, 3)
     )
     inp = AtomicInput(molecule=water, specification=AtomicSpecification(program="gaussian", driver="gradient", model={"method": "HF", "basis": "STO-3G"}))
-    log_text = _NORMAL_LOG
+    log_text = _g16_log(forces=forces)
 
     job_record = {
         "infiles": {"gaussian.com": ""},
@@ -743,7 +763,8 @@ def test_compute_returns_atomic_result_hessian(harness, water):
         "scratch_directory": None,
         "scratch_messy": False,
     }
-    dexe = {"outfiles": {"gaussian.log": log_text}, "stdout": "", "stderr": ""}
+    punch = _punch(list(np.zeros(9)) + list(hess_matrix[np.tril_indices(9)]))
+    dexe = {"outfiles": {"gaussian.log": log_text, "fort.7": punch}, "stdout": "", "stderr": ""}
 
     with patch("qcengine.programs.gaussian.runner._find_gaussian", return_value="/g16"):
         with patch("qcengine.programs.gaussian.runner.which_import", return_value=True):
@@ -1005,17 +1026,13 @@ def test_harvest_energies_missing_scf_raises():
 # rq-36736115
 @requires_cclib
 def test_harvest_gradient_negated():
+    """The gradient is the negated last forces block (input orientation)."""
     in_mol = _make_water_mol()
     forces = np.array([[0.01, 0.0, -0.02], [0.0, 0.005, 0.01], [0.0, -0.005, 0.01]])
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-2041.3]),
-        grads=forces[np.newaxis, :, :],
-    )
-    with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
-    expected = -forces.flatten()
-    assert grad is not None
-    np.testing.assert_allclose(grad, expected, atol=1e-12)
+    log = _g16_log(mol=in_mol, forces=10 * forces) + _g16_log(mol=in_mol, forces=forces)
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        _, grad, _, _, _ = harvest(in_mol, "hf", log)
+    np.testing.assert_allclose(grad, -forces.flatten(), atol=1e-12)
 
 
 # rq-3b0adf96
@@ -1025,7 +1042,7 @@ def test_harvest_no_gradient_when_absent():
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     # grads is None (no attribute)
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
     assert grad is None
 
 
@@ -1039,14 +1056,9 @@ def test_harvest_no_gradient_when_absent():
 def test_harvest_hessian():
     in_mol = _make_water_mol()
     hess_matrix = np.eye(9) * 0.5
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-2041.3]),
-        hessian=hess_matrix,
-    )
-    with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
-    assert hess is not None
-    assert hess.shape == (9, 9)
+    punch = _punch(list(np.zeros(9)) + list(hess_matrix[np.tril_indices(9)]))
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        _, _, hess, _, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol), punch)
     np.testing.assert_allclose(hess, hess_matrix)
 
 
@@ -1056,7 +1068,7 @@ def test_harvest_no_hessian_when_absent():
     in_mol = _make_water_mol()
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
     assert hess is None
 
 
@@ -1070,7 +1082,7 @@ def test_harvest_no_hessian_when_absent():
 def test_harvest_dipole_from_archive():
     in_mol = _make_water_mol()
     with _patch_cclib(_make_ccdata_with_attrs()):
-        qcvars, _, _, _, _ = harvest(in_mol, "hf", _g16_log(archive="\\Dipole=0.,0.,-0.6358857"))
+        qcvars, _, _, _, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol, archive="\\Dipole=0.,0.,-0.6358857"))
     np.testing.assert_allclose(qcvars["CURRENT DIPOLE"], [0.0, 0.0, -0.6358857])
     np.testing.assert_allclose(qcvars["HF DIPOLE"], [0.0, 0.0, -0.6358857])
 
@@ -1109,7 +1121,7 @@ def test_harvest_mulliken_charges():
         atomcharges={"mulliken": charges},
     )
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
     assert "MULLIKEN CHARGES" in qcvars
     assert len(qcvars["MULLIKEN CHARGES"]) == 3
 
@@ -1123,7 +1135,7 @@ def test_harvest_missing_mulliken_no_error():
         atomcharges={},
     )
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
     assert "MULLIKEN CHARGES" not in qcvars
 
 
@@ -1138,7 +1150,7 @@ def test_harvest_output_molecule_symbols():
     in_mol = _make_water_mol()
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     with _patch_cclib(ccdata):
-        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log())
+        qcvars, grad, hess, out_mol, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
     assert list(out_mol.symbols) == ["O", "H", "H"]
 
 
@@ -1149,22 +1161,17 @@ def test_harvest_nre_cross_check_passes():
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     # Should not raise
     with _patch_cclib(ccdata):
-        harvest(in_mol, "hf", _g16_log())
+        harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
 
 
 # rq-0b4cf843
 @requires_cclib
-def test_harvest_nre_mismatch_raises():
+def test_harvest_geometry_mismatch_raises():
     in_mol = _make_water_mol()
-    # Use very different geometry to force NRE mismatch
-    far_coords = np.array([[[0.0, 0.0, 100.0], [0.0, 0.0, 200.0], [0.0, 0.0, 300.0]]])
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-2041.3]),
-        atomcoords=far_coords,
-    )
-    with _patch_cclib(ccdata):
-        with pytest.raises(ValueError, match="inconsistent"):
-            harvest(in_mol, "hf", _g16_log())
+    moved = Molecule(**{**in_mol.model_dump(), "geometry": in_mol.geometry + 1.0e-3})
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        with pytest.raises(ValueError, match="differs from the input molecule"):
+            harvest(in_mol, "hf", _g16_log(mol=moved))
 
 
 # ---------------------------------------------------------------------------
@@ -1174,15 +1181,12 @@ def test_harvest_nre_mismatch_raises():
 
 # rq-b7c7b8cb
 @requires_cclib
-def test_harvest_no_coords_raises():
+def test_harvest_no_archive_raises():
     in_mol = _make_water_mol()
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-2041.3]),
-        atomcoords=np.array([]),  # empty
-    )
-    with _patch_cclib(ccdata):
-        with pytest.raises(ValueError):
-            harvest(in_mol, "hf", _g16_log())
+    log = " SCF Done:  E(RHF) =  -76.0105049953     A.U. after   10 cycles\n Normal termination of Gaussian 16\n"
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        with pytest.raises(ValueError, match="No archive entry"):
+            harvest(in_mol, "hf", log)
 
 
 # rq-bb775969
@@ -1369,7 +1373,7 @@ def test_ghost_out_mol_real_preserved():
         atomnos=np.array([2, 10]),
     )
     with _patch_cclib(ccdata):
-        _, _, _, out_mol, _ = harvest(in_mol, "hf", _g16_log())
+        _, _, _, out_mol, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
     assert list(out_mol.real) == [True, False]
 
 
@@ -1383,7 +1387,7 @@ def test_ghost_out_mol_symbols_from_in_mol():
         atomnos=np.array([2, 10]),
     )
     with _patch_cclib(ccdata):
-        _, _, _, out_mol, _ = harvest(in_mol, "hf", _g16_log())
+        _, _, _, out_mol, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
     assert list(out_mol.symbols) == ["He", "Ne"]
 
 
@@ -1398,22 +1402,17 @@ def test_ghost_atom_count_sanity_check_passes():
     )
     with _patch_cclib(ccdata):
         # Should not raise: 2 atoms in cclib output == 2 atoms in in_mol
-        harvest(in_mol, "hf", _g16_log())
+        harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
 
 
 # rq-66067019
 @requires_cclib
 def test_ghost_atom_count_mismatch_raises():
     in_mol = _make_hene_ghost_mol()  # 2 atoms
-    # cclib reports 3 atoms but in_mol has 2 → mismatch
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-77.7]),
-        atomcoords=np.array([[[0.0, 0.0, 0.0], [2.5, 0.0, 0.0], [5.0, 0.0, 0.0]]]),
-        atomnos=np.array([2, 10, 10]),
-    )
-    with _patch_cclib(ccdata):
+    three = Molecule.from_data("He 0 0 0\n@Ne 2.5 0 0\n@Ne 5 0 0")
+    with _patch_cclib(_make_ccdata_with_attrs()):
         with pytest.raises(ValueError, match="atom count"):
-            harvest(in_mol, "hf", _g16_log())
+            harvest(in_mol, "hf", _g16_log(mol=three))
 
 
 # rq-a69d0898
@@ -1427,36 +1426,25 @@ def test_ghost_nre_check_excludes_ghosts():
     )
     with _patch_cclib(ccdata):
         # NRE = 0 for both (single real atom), no ValueError
-        harvest(in_mol, "hf", _g16_log())
+        harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
 
 
 # rq-b57c882b
 @requires_cclib
-def test_ghost_nre_mismatch_still_raises():
-    # Use a 2 real + 1 ghost system so the real-atom-only NRE is nonzero
-    # and can mismatch when the parsed geometry differs.
+def test_ghost_geometry_mismatch_still_raises():
     in_mol = Molecule.from_data(
         {
             "symbols": ["H", "H", "He"],
             "geometry": [0.0, 0.0, 0.0, 0.0, 0.0, 1.4, 5.0, 0.0, 0.0],
             "real": [True, True, False],
-            "molecular_charge": 0,
-            "molecular_multiplicity": 1,
             "fix_com": True,
             "fix_orientation": True,
         }
     )
-    # Parsed geometry has the two real H atoms far apart, so the
-    # real-atom-only NRE differs from in_mol's by far more than 1e-3 Ha.
-    far_coords = np.array([[[0.0, 0.0, 0.0], [0.0, 0.0, 50.0], [5.0, 0.0, 0.0]]])
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-1.0]),
-        atomcoords=far_coords,
-        atomnos=np.array([1, 1, 2]),
-    )
-    with _patch_cclib(ccdata):
-        with pytest.raises(ValueError, match="inconsistent"):
-            harvest(in_mol, "hf", _g16_log())
+    moved_ghost = Molecule(**{**in_mol.model_dump(), "geometry": [0.0, 0.0, 0.0, 0.0, 0.0, 1.4, 5.1, 0.0, 0.0]})
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        with pytest.raises(ValueError, match="differs from the input molecule"):
+            harvest(in_mol, "hf", _g16_log(mol=moved_ghost))
 
 
 # rq-e5a98119
@@ -1466,7 +1454,7 @@ def test_ghost_nre_check_unchanged_for_all_real():
     ccdata = _make_ccdata_with_attrs(scfenergies=np.array([-2041.3]))
     with _patch_cclib(ccdata):
         # Existing behaviour: no ghosts, full-mol NRE comparison, no raise
-        harvest(in_mol, "hf", _g16_log())
+        harvest(in_mol, "hf", _g16_log(mol=in_mol, ))
 
 
 # rq-d97cc860
@@ -1475,47 +1463,29 @@ def test_ghost_gradient_spans_real_and_ghost():
     in_mol = _make_hene_ghost_mol()
     # Forces: nonzero on He, zero on Ne (ghost)
     forces = np.array([[0.001, 0.0, 0.0], [0.0, 0.0, 0.0]])
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-77.7]),
-        atomcoords=np.array([[[0.0, 0.0, 0.0], [2.5, 0.0, 0.0]]]),
-        atomnos=np.array([2, 10]),
-        grads=forces[np.newaxis, :, :],
-    )
-    with _patch_cclib(ccdata):
-        _, grad, _, _, _ = harvest(in_mol, "hf", _g16_log())
-    assert grad is not None
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        _, grad, _, _, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol, forces=forces))
     assert grad.shape == (6,)
-    # Ghost atom (index 1) gradient is zero
     np.testing.assert_allclose(grad[3:6], np.zeros(3), atol=1e-12)
 
 
 # rq-f8ce079b
 @requires_cclib
-def test_ghost_align_uses_generic_ghosts():
-    # The harvester constructs calc_mol via qcelemental.models.Molecule (v1)
-    # and dispatches align() on it, so spy on the same class.
-    from qcelemental.models import Molecule as HarvesterMolecule
+@pytest.mark.parametrize("fixed_frame", [True, False])
+def test_harvest_returns_input_molecule_without_alignment(fixed_frame):
+    """All harvested quantities are in Gaussian's input orientation, so the input
+    molecule is returned unchanged and no alignment (atom-mapping search) is done."""
+    from qcelemental.models.v2 import Molecule as V2Molecule
 
-    in_mol = _make_hene_ghost_mol()
-    ccdata = _make_ccdata_with_attrs(
-        scfenergies=np.array([-77.7]),
-        atomcoords=np.array([[[0.0, 0.0, 0.0], [2.5, 0.0, 0.0]]]),
-        atomnos=np.array([2, 10]),
-    )
+    in_mol = Molecule(**{**_make_hene_ghost_mol().model_dump(), "fix_com": fixed_frame, "fix_orientation": fixed_frame})
 
-    captured = {"calls": []}
-    real_align = HarvesterMolecule.align
+    def no_align(*args, **kwargs):
+        raise AssertionError("Molecule.align must not be called")
 
-    def spy_align(self, other, **kwargs):
-        captured["calls"].append(kwargs)
-        return real_align(self, other, **kwargs)
-
-    with _patch_cclib(ccdata):
-        with patch.object(HarvesterMolecule, "align", spy_align):
-            harvest(in_mol, "hf", _g16_log())
-
-    assert captured["calls"], "expected at least one Molecule.align call"
-    assert all(call.get("generic_ghosts") is True for call in captured["calls"])
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        with patch.object(V2Molecule, "align", no_align):
+            _, _, _, out_mol, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol))
+    assert out_mol is in_mol
 
 
 # rq-04028610
@@ -1529,7 +1499,7 @@ def test_ghost_compute_preserves_ghost_designation(harness):
         atomcoords=np.array([[[0.0, 0.0, 0.0], [2.5, 0.0, 0.0]]]),
         atomnos=np.array([2, 10]),
     )
-    log_text = _NORMAL_LOG
+    log_text = _g16_log(mol=in_mol)
     job_record = {
         "infiles": {"gaussian.com": "%NProcShared=1\n#P HF/STO-3G\n"},
         "command": ["/g16", "gaussian.com"],
@@ -1704,7 +1674,7 @@ def test_atom_labels_out_mol_preserves_labels_when_fixed():
         atomnos=np.array([1, 1, 1, 1]),
     )
     with _patch_cclib(ccdata):
-        _, _, _, out_mol, _ = harvest(mol, "hf", _g16_log())
+        _, _, _, out_mol, _ = harvest(mol, "hf", _g16_log(mol=mol))
     assert list(out_mol.atom_labels) == ["", "5", "_other", "_4sq"]
 
 
@@ -1942,12 +1912,12 @@ def test_dispersion_harvest_suffix_reaches_qcvars():
 # rq-1d5da737
 @requires_cclib
 def test_dispersion_harvest_gradient_unchanged():
-    """cclib's grads is the total (dispersion-inclusive) force."""
+    """Gaussian's printed forces are the total (dispersion-inclusive) force."""
     in_mol = _make_water_mol()
     forces = np.array([[0.01, 0.0, -0.02], [0.0, 0.005, 0.01], [0.0, -0.005, 0.01]])
-    ccdata = _make_ccdata_with_attrs(grads=forces[np.newaxis, :, :])
-    with _patch_cclib(ccdata):
-        _, grad, _, _, _ = harvest(in_mol, "b3lyp-d3bj", _DISP_LOG)
+    log = _g16_log(scf=_DISP_SCF, scf_label="RB3LYP", pre=f" R6Disp:  Grimme-D3(BJ) Dispersion energy=       {_DISP_D} Hartrees.\n", forces=forces)
+    with _patch_cclib(_make_ccdata_with_attrs()):
+        _, grad, _, _, _ = harvest(in_mol, "b3lyp-d3bj", log)
     np.testing.assert_allclose(grad, -forces.flatten(), atol=1e-12)
 
 
@@ -1993,7 +1963,7 @@ def test_harvest_hessian_prefers_punch_file():
     hess = hess + hess.T
     punch = _punch(list(np.zeros(9)) + list(hess[np.tril_indices(9)]))
     with _patch_cclib(_make_ccdata_with_attrs()):
-        _, _, out_hess, _, _ = harvest(in_mol, "hf", _g16_log(), punch)
+        _, _, out_hess, _, _ = harvest(in_mol, "hf", _g16_log(mol=in_mol, ), punch)
     np.testing.assert_allclose(out_hess, hess)
 
 
@@ -2668,7 +2638,7 @@ def test_harvest_dipole_derivatives_from_archive():
     values = np.arange(27, dtype=float) * 0.01
     archive = "\\DipoleDeriv=" + ",".join(f"{v:.7f}" for v in values)
     with _patch_cclib(_make_ccdata_with_attrs()):
-        *_, dipder = harvest(in_mol, "hf", _g16_log(archive=archive))
+        *_, dipder = harvest(in_mol, "hf", _g16_log(mol=in_mol, archive=archive))
     # row per Cartesian coordinate, column per dipole component (as Psi4's CURRENT DIPOLE GRADIENT)
     np.testing.assert_allclose(dipder, values.reshape(9, 3))
 
@@ -3025,3 +2995,34 @@ def test_gaussiandriver_molecule_identity():
         assert mol.provenance.creator != "initial-creator"
         assert mol.identifiers.smiles == "O"
     np.testing.assert_allclose(res.properties.return_gradient, res.trajectory_results[-1].return_result)
+
+
+# Production failures (CCBench): heavy atoms made 6-decimal coordinates miss align()'s NRE
+# check, and near-symmetric Li3F3 made align()'s atom-mapping search pick a wrong permutation.
+_BBR3_BOHR = [0.0, 0.0, 0.0, 3.5990383, 0.0, 0.0, 5.39855745, -3.1168586, 0.0, 5.39855745, 3.1168586, 0.0]
+_LI3F3_BOHR = [0.0, 0.0, 0.0, 2.99617116, 0.0, 0.0, 4.28218146, -2.70691542, 0.0, 2.78445487, -5.30188299, 0.0, -0.20284094, -5.06255615, 0.0, -1.70164442, -2.46821042, 0.0]
+
+
+@using("gaussian")
+@using("psi4")
+@pytest.mark.parametrize(
+    "symbols, geometry",
+    [(["Br", "B", "Br", "Br"], _BBR3_BOHR), (["Li", "F", "Li", "F", "Li", "F"], _LI3F3_BOHR)],
+    ids=["BBr3", "Li3F3"],
+)
+@pytest.mark.parametrize("fixed_frame", [True, False])
+def test_gaussian_heavy_and_near_symmetric_molecules(symbols, geometry, fixed_frame):
+    import qcengine as qcng
+
+    mol = Molecule(symbols=symbols, geometry=geometry, fix_com=fixed_frame, fix_orientation=fixed_frame)
+    fixed = Molecule(symbols=symbols, geometry=geometry, fix_com=True, fix_orientation=True)
+
+    def run(program, molecule, keywords):
+        inp = AtomicInput(molecule=molecule, specification=AtomicSpecification(program=program, driver="gradient", model={"method": "hf", "basis": "3-21g"}, keywords=keywords))
+        return qcng.compute(inp, program, raise_error=True)
+
+    # Gaussian results are in the input frame either way; Psi4 reference in the fixed input frame
+    gau = run("gaussian", mol, {})
+    psi = run("psi4", fixed, {"scf_type": "pk", "d_convergence": 10, "puream": False})
+    np.testing.assert_array_equal(gau.molecule.geometry, mol.geometry)
+    np.testing.assert_allclose(gau.return_result, psi.return_result, atol=1.0e-7)

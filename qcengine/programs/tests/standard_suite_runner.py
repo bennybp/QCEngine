@@ -203,7 +203,8 @@ def runner_asserter(inp, ref_subject, method, basis, tnm, scramble, frame, model
     else:
         # this check assumes the qcprog will adjust an ugly Cartesian geometry into a pretty one (with more symmetry for computational efficiency).
         # if qcprog doesn't have that behavior, it will need to be excused from this check.
-        if qcprog != "jaguar":
+        # gaussian: all harvested quantities are in Gaussian's input orientation, so the input frame is returned.
+        if qcprog not in ("jaguar", "gaussian"):
             with np.printoptions(precision=3, suppress=True):
                 assert compare(
                     min_nonzero_coords,

@@ -7,12 +7,18 @@ import numpy as np
 import qcelemental as qcel
 from qcelemental.models.v2 import Molecule
 
-from qcengine.programs.gaussian.harvester import _ALPHA_BETA_RE, _parse_archive, harvest_energies
+from qcengine.programs.gaussian.harvester import (
+    _ALPHA_BETA_RE,
+    _FORCES_RE,
+    _atom_table,
+    _parse_archive,
+    archive_geometry,
+    harvest_energies,
+)
 from qcengine.programs.gaussian.germinate import recognize_dispersion
 from qcengine.programs.util import PreservingDict
 
 _GEOMETRY_RE = re.compile(r"Input orientation:\s*\n\s*-+\n.*?\n.*?\n\s*-+\n(.*?)\n\s*-+", re.S)
-_FORCES_RE = re.compile(r"Forces \(Hartrees/Bohr\)\s*\n.*?\n\s*-+\n(.*?)\n\s*-+", re.S)
 
 # Final archive geometry vs. the last printed (6-decimal) geometry [Angstrom]
 _FINAL_GEOMETRY_ATOL = 2.0e-6
@@ -22,14 +28,6 @@ class OptimizationStep(NamedTuple):
     molecule: Molecule
     qcvars: PreservingDict
     gradient: np.ndarray  # (natom, 3) [Eh/a0]
-
-
-def _table(block: str, natom: int) -> np.ndarray:
-    """Last three columns of a Gaussian per-atom table (geometry or forces)."""
-    rows = [line.split()[-3:] for line in block.strip().splitlines()]
-    if len(rows) != natom:
-        raise ValueError(f"Expected {natom} atoms in a Gaussian table, found {len(rows)}.")
-    return np.array(rows, dtype=float)
 
 
 def harvest_optimization(in_mol: Molecule, method: str, log_content: str) -> List[OptimizationStep]:
@@ -61,23 +59,20 @@ def harvest_optimization(in_mol: Molecule, method: str, log_content: str) -> Lis
             k: v for k, v in base["identifiers"].items() if k not in ("molecule_hash", "pubchem_conformerid")
         }
 
-    # final geometry from the archive: "charge,mult\Sym,x,y,z\..." [Angstrom]
     _parse_archive(log_content)  # validates the archive entry
-    text = re.sub(r"\n ", "", log_content[log_content.rfind("1\\1\\GINC") :])
-    geom_section = text.split("\\\\")[3].split("\\")[1:]
-    final_geometry = np.array([atom.split(",")[-3:] for atom in geom_section], dtype=float)
+    final_geometry = archive_geometry(log_content)
 
     alpha_beta = _ALPHA_BETA_RE.search(log_content)
 
     steps = []
     for i, seg in enumerate(segments):
         last = i == len(segments) - 1
-        geometry = _table(_GEOMETRY_RE.search(seg).group(1), natom)
+        geometry = _atom_table(_GEOMETRY_RE.search(seg).group(1), natom)
         if last:
             if np.abs(final_geometry - geometry).max() > _FINAL_GEOMETRY_ATOL:
                 raise ValueError("Gaussian archive geometry does not match the last optimization step.")
             geometry = final_geometry
-        forces = _table(_FORCES_RE.search(seg).group(1), natom)
+        forces = _atom_table(_FORCES_RE.search(seg).group(1), natom)
 
         ref_text = seg[: seg.find("Forces (Hartrees/Bohr)")]
         qcvars = harvest_energies(
